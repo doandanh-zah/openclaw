@@ -45,6 +45,10 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
         <service
+            android:name=".GatewayLocalService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+        <service
             android:name=".node.DeviceNotificationListenerService"
             android:label="@string/app_name"
             android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
