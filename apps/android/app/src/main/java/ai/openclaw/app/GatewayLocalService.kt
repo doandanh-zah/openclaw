@@ -34,6 +34,8 @@ class GatewayLocalService : Service() {
   private var localToken: String = ""
   private var telegramBotToken: String = ""
   private var telegramChatId: String = ""
+  private var lastInboundText: String = ""
+  private var lastOutboundText: String = ""
 
   override fun onCreate() {
     super.onCreate()
@@ -176,11 +178,39 @@ class GatewayLocalService : Service() {
             sendJson(out, 200, "{\"ok\":true,\"session\":{\"id\":\"android-local-main\"}}")
           }
         }
+        path == "/v1/telegram/update" && method == "POST" -> {
+          if (!authorized(headers)) {
+            sendJson(out, 401, "{\"error\":\"unauthorized\"}")
+          } else {
+            val text = jsonField(body, "text")
+            val chat = jsonField(body, "chatId").ifBlank { telegramChatId }
+            if (text.isBlank()) {
+              sendJson(out, 400, "{\"error\":\"invalid_payload\",\"need\":[\"text\"]}")
+            } else {
+              lastInboundText = text
+              // Minimal pipeline: map inbound Telegram text into a local response.
+              lastOutboundText = "[android-local] received: $text"
+              val payload =
+                "{\"ok\":true,\"received\":\"${escapeJson(text)}\",\"chatId\":\"${escapeJson(chat)}\",\"reply\":\"${escapeJson(lastOutboundText)}\"}"
+              sendJson(out, 200, payload)
+            }
+          }
+        }
+        path == "/v1/telegram/outbox" && method == "GET" -> {
+          if (!authorized(headers)) {
+            sendJson(out, 401, "{\"error\":\"unauthorized\"}")
+          } else {
+            val payload =
+              "{\"ok\":true,\"chatId\":\"${escapeJson(telegramChatId)}\",\"lastInbound\":\"${escapeJson(lastInboundText)}\",\"lastOutbound\":\"${escapeJson(lastOutboundText)}\"}"
+            sendJson(out, 200, payload)
+          }
+        }
         path == "/v1/messages" && method == "POST" -> {
           if (!authorized(headers)) {
             sendJson(out, 401, "{\"error\":\"unauthorized\"}")
           } else {
-            val escaped = body.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
+            val escaped = escapeJson(body)
+            lastOutboundText = body.take(400)
             sendJson(
               out,
               200,
@@ -252,6 +282,9 @@ class GatewayLocalService : Service() {
     val re = Regex("\"$key\"\\s*:\\s*\"([^\"]*)\"")
     return re.find(body)?.groupValues?.getOrNull(1)?.trim().orEmpty()
   }
+
+  private fun escapeJson(value: String): String =
+    value.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
 
   private fun maskToken(token: String): String {
     if (token.length <= 8) return token
