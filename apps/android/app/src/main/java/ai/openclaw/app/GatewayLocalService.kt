@@ -32,6 +32,8 @@ class GatewayLocalService : Service() {
   private var serverThread: Thread? = null
   private var serverSocket: ServerSocket? = null
   private var localToken: String = ""
+  private var telegramBotToken: String = ""
+  private var telegramChatId: String = ""
 
   override fun onCreate() {
     super.onCreate()
@@ -124,11 +126,48 @@ class GatewayLocalService : Service() {
         path == "/health" -> sendJson(out, 200, "{\"ok\":true,\"service\":\"gateway-local\"}")
         path == "/status" -> {
           val payload =
-            "{\"ok\":true,\"port\":$PORT,\"running\":${isRunning.get()},\"mode\":\"scaffold\",\"tokenReady\":${localToken.isNotBlank()}}"
+            "{\"ok\":true,\"port\":$PORT,\"running\":${isRunning.get()},\"mode\":\"scaffold\",\"tokenReady\":${localToken.isNotBlank()},\"telegramConfigured\":${telegramBotToken.isNotBlank() && telegramChatId.isNotBlank()}}"
           sendJson(out, 200, payload)
         }
         path == "/token" && method == "GET" -> {
           sendJson(out, 200, "{\"token\":\"$localToken\"}")
+        }
+        path == "/v1/gateway/start" && method == "POST" -> {
+          if (!authorized(headers)) {
+            sendJson(out, 401, "{\"error\":\"unauthorized\"}")
+          } else {
+            sendJson(out, 200, "{\"ok\":true,\"message\":\"gateway already running in app service\"}")
+          }
+        }
+        path == "/v1/gateway/status" && method == "GET" -> {
+          if (!authorized(headers)) {
+            sendJson(out, 401, "{\"error\":\"unauthorized\"}")
+          } else {
+            sendJson(out, 200, "{\"ok\":true,\"running\":${isRunning.get()},\"port\":$PORT}")
+          }
+        }
+        path == "/v1/config/telegram" && method == "POST" -> {
+          if (!authorized(headers)) {
+            sendJson(out, 401, "{\"error\":\"unauthorized\"}")
+          } else {
+            val bot = jsonField(body, "botToken")
+            val chat = jsonField(body, "chatId")
+            if (bot.isBlank() || chat.isBlank()) {
+              sendJson(out, 400, "{\"error\":\"invalid_payload\",\"need\":[\"botToken\",\"chatId\"]}")
+            } else {
+              telegramBotToken = bot
+              telegramChatId = chat
+              sendJson(out, 200, "{\"ok\":true,\"configured\":true}")
+            }
+          }
+        }
+        path == "/v1/config/telegram" && method == "GET" -> {
+          if (!authorized(headers)) {
+            sendJson(out, 401, "{\"error\":\"unauthorized\"}")
+          } else {
+            val masked = maskToken(telegramBotToken)
+            sendJson(out, 200, "{\"ok\":true,\"configured\":${telegramBotToken.isNotBlank() && telegramChatId.isNotBlank()},\"botToken\":\"$masked\",\"chatId\":\"${telegramChatId}\"}")
+          }
         }
         path == "/v1/session" && method == "GET" -> {
           if (!authorized(headers)) {
@@ -202,11 +241,22 @@ class GatewayLocalService : Service() {
   private fun statusText(code: Int): String =
     when (code) {
       200 -> "OK"
+      400 -> "Bad Request"
       401 -> "Unauthorized"
       404 -> "Not Found"
       501 -> "Not Implemented"
       else -> "OK"
     }
+
+  private fun jsonField(body: String, key: String): String {
+    val re = Regex("\"$key\"\\s*:\\s*\"([^\"]*)\"")
+    return re.find(body)?.groupValues?.getOrNull(1)?.trim().orEmpty()
+  }
+
+  private fun maskToken(token: String): String {
+    if (token.length <= 8) return token
+    return token.take(4) + "****" + token.takeLast(4)
+  }
 
   private fun ensureChannel() {
     val mgr = getSystemService(NotificationManager::class.java)
