@@ -17,6 +17,7 @@ import java.net.ServerSocket
 import java.net.SocketException
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 
 /**
@@ -35,6 +36,7 @@ class GatewayLocalService : Service() {
   override fun onCreate() {
     super.onCreate()
     localToken = UUID.randomUUID().toString().replace("-", "")
+    tokenRef.set(localToken)
     ensureChannel()
     startForeground(NOTIFICATION_ID, buildNotification("Starting local gateway…"))
     startServer()
@@ -53,6 +55,7 @@ class GatewayLocalService : Service() {
   override fun onDestroy() {
     stopServer()
     isRunning.set(false)
+    tokenRef.set("")
     super.onDestroy()
   }
 
@@ -64,7 +67,6 @@ class GatewayLocalService : Service() {
     serverThread =
       thread(start = true, name = "openclaw-local-gateway") {
         try {
-          // Bind all interfaces for LAN reachability on Android device.
           val ss = ServerSocket(PORT)
           serverSocket = ss
           isRunning.set(true)
@@ -115,22 +117,40 @@ class GatewayLocalService : Service() {
         }
       }
 
+      val body = readBody(reader, headers)
+
       when {
         path == "/" -> sendText(out, 200, "OpenClaw Android local gateway alive\n")
         path == "/health" -> sendJson(out, 200, "{\"ok\":true,\"service\":\"gateway-local\"}")
         path == "/status" -> {
-          val body =
-            "{\"ok\":true,\"port\":$PORT,\"running\":${isRunning.get()},\"mode\":\"scaffold\"}"
-          sendJson(out, 200, body)
+          val payload =
+            "{\"ok\":true,\"port\":$PORT,\"running\":${isRunning.get()},\"mode\":\"scaffold\",\"tokenReady\":${localToken.isNotBlank()}}"
+          sendJson(out, 200, payload)
         }
         path == "/token" && method == "GET" -> {
-          // Local-only bootstrap helper for operator during dev.
           sendJson(out, 200, "{\"token\":\"$localToken\"}")
         }
+        path == "/v1/session" && method == "GET" -> {
+          if (!authorized(headers)) {
+            sendJson(out, 401, "{\"error\":\"unauthorized\"}")
+          } else {
+            sendJson(out, 200, "{\"ok\":true,\"session\":{\"id\":\"android-local-main\"}}")
+          }
+        }
+        path == "/v1/messages" && method == "POST" -> {
+          if (!authorized(headers)) {
+            sendJson(out, 401, "{\"error\":\"unauthorized\"}")
+          } else {
+            val escaped = body.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
+            sendJson(
+              out,
+              200,
+              "{\"ok\":true,\"echo\":\"$escaped\",\"message\":\"gateway-local accepted request\"}",
+            )
+          }
+        }
         path.startsWith("/v1/") -> {
-          val auth = headers["authorization"].orEmpty()
-          val expected = "Bearer $localToken"
-          if (auth != expected) {
+          if (!authorized(headers)) {
             sendJson(out, 401, "{\"error\":\"unauthorized\"}")
           } else {
             sendJson(out, 501, "{\"error\":\"not_implemented\",\"message\":\"Gateway protocol adapter pending\"}")
@@ -139,6 +159,24 @@ class GatewayLocalService : Service() {
         else -> sendJson(out, 404, "{\"error\":\"not_found\"}")
       }
     }
+  }
+
+  private fun readBody(reader: BufferedReader, headers: Map<String, String>): String {
+    val len = headers["content-length"]?.toIntOrNull() ?: return ""
+    if (len <= 0) return ""
+    val chars = CharArray(len)
+    var read = 0
+    while (read < len) {
+      val n = reader.read(chars, read, len - read)
+      if (n <= 0) break
+      read += n
+    }
+    return String(chars, 0, read)
+  }
+
+  private fun authorized(headers: Map<String, String>): Boolean {
+    val auth = headers["authorization"].orEmpty()
+    return auth == "Bearer $localToken"
   }
 
   private fun sendText(out: BufferedWriter, status: Int, body: String) {
@@ -229,8 +267,11 @@ class GatewayLocalService : Service() {
     const val PORT = 18789
 
     private val isRunning = AtomicBoolean(false)
+    private val tokenRef = AtomicReference("")
 
     fun running(): Boolean = isRunning.get()
+
+    fun currentToken(): String = tokenRef.get()
 
     fun start(context: Context) {
       val intent = Intent(context, GatewayLocalService::class.java)

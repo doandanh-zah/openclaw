@@ -1,6 +1,8 @@
 package ai.openclaw.app.ui
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -83,6 +85,7 @@ fun SettingsSheet(viewModel: MainViewModel) {
   val preventSleep by viewModel.preventSleep.collectAsState()
   val canvasDebugStatusEnabled by viewModel.canvasDebugStatusEnabled.collectAsState()
   var localGatewayEnabled by remember { mutableStateOf(GatewayLocalService.running()) }
+  var localGatewayToken by remember { mutableStateOf(GatewayLocalService.currentToken()) }
 
   val listState = rememberLazyListState()
   val deviceModel =
@@ -276,6 +279,7 @@ fun SettingsSheet(viewModel: MainViewModel) {
             ContextCompat.checkSelfPermission(context, Manifest.permission.SEND_SMS) ==
               PackageManager.PERMISSION_GRANTED
           localGatewayEnabled = GatewayLocalService.running()
+          localGatewayToken = GatewayLocalService.currentToken()
         }
       }
     lifecycleOwner.lifecycle.addObserver(observer)
@@ -719,8 +723,36 @@ fun SettingsSheet(viewModel: MainViewModel) {
                   } else {
                     GatewayLocalService.stop(context)
                   }
+                  localGatewayToken = GatewayLocalService.currentToken()
                 },
               )
+            },
+          )
+          HorizontalDivider(color = mobileBorder)
+          ListItem(
+            modifier = Modifier.fillMaxWidth(),
+            colors = listItemColors,
+            headlineContent = { Text("Gateway Token", style = mobileHeadline) },
+            supportingContent = {
+              val tokenPreview =
+                if (localGatewayToken.isBlank()) "Start Local Gateway to generate token"
+                else localGatewayToken.take(16) + "…"
+              Text(tokenPreview, style = mobileCallout)
+            },
+            trailingContent = {
+              Button(
+                onClick = {
+                  if (localGatewayToken.isNotBlank()) {
+                    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    cm.setPrimaryClip(ClipData.newPlainText("openclaw_gateway_token", localGatewayToken))
+                  }
+                },
+                enabled = localGatewayToken.isNotBlank(),
+                colors = settingsPrimaryButtonColors(),
+                shape = RoundedCornerShape(14.dp),
+              ) {
+                Text("Copy", style = mobileCallout.copy(fontWeight = FontWeight.Bold))
+              }
             },
           )
           HorizontalDivider(color = mobileBorder)
