@@ -13,8 +13,11 @@ import java.io.BufferedReader
 import java.io.BufferedWriter
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
+import java.net.HttpURLConnection
 import java.net.ServerSocket
 import java.net.SocketException
+import java.net.URL
+import java.net.URLEncoder
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
@@ -36,6 +39,7 @@ class GatewayLocalService : Service() {
   private var telegramChatId: String = ""
   private var lastInboundText: String = ""
   private var lastOutboundText: String = ""
+  private var lastTelegramError: String = ""
 
   override fun onCreate() {
     super.onCreate()
@@ -168,7 +172,7 @@ class GatewayLocalService : Service() {
             sendJson(out, 401, "{\"error\":\"unauthorized\"}")
           } else {
             val masked = maskToken(telegramBotToken)
-            sendJson(out, 200, "{\"ok\":true,\"configured\":${telegramBotToken.isNotBlank() && telegramChatId.isNotBlank()},\"botToken\":\"$masked\",\"chatId\":\"${telegramChatId}\"}")
+            sendJson(out, 200, "{\"ok\":true,\"configured\":${telegramBotToken.isNotBlank() && telegramChatId.isNotBlank()},\"botToken\":\"$masked\",\"chatId\":\"${telegramChatId}\",\"lastError\":\"${escapeJson(lastTelegramError)}\"}")
           }
         }
         path == "/v1/session" && method == "GET" -> {
@@ -190,9 +194,29 @@ class GatewayLocalService : Service() {
               lastInboundText = text
               // Minimal pipeline: map inbound Telegram text into a local response.
               lastOutboundText = "[android-local] received: $text"
+              val sent = if (telegramBotToken.isNotBlank() && chat.isNotBlank()) sendTelegramMessage(chat, lastOutboundText) else false
               val payload =
-                "{\"ok\":true,\"received\":\"${escapeJson(text)}\",\"chatId\":\"${escapeJson(chat)}\",\"reply\":\"${escapeJson(lastOutboundText)}\"}"
+                "{\"ok\":true,\"received\":\"${escapeJson(text)}\",\"chatId\":\"${escapeJson(chat)}\",\"reply\":\"${escapeJson(lastOutboundText)}\",\"telegramSent\":$sent}"
               sendJson(out, 200, payload)
+            }
+          }
+        }
+        path == "/v1/telegram/send" && method == "POST" -> {
+          if (!authorized(headers)) {
+            sendJson(out, 401, "{\"error\":\"unauthorized\"}")
+          } else {
+            val text = jsonField(body, "text")
+            val chat = jsonField(body, "chatId").ifBlank { telegramChatId }
+            if (telegramBotToken.isBlank() || chat.isBlank() || text.isBlank()) {
+              sendJson(out, 400, "{\"error\":\"invalid_payload\",\"need\":[\"botToken\",\"chatId\",\"text\"]}")
+            } else {
+              val sent = sendTelegramMessage(chat, text)
+              if (sent) {
+                lastOutboundText = text
+                sendJson(out, 200, "{\"ok\":true,\"sent\":true}")
+              } else {
+                sendJson(out, 500, "{\"ok\":false,\"sent\":false}")
+              }
             }
           }
         }
@@ -274,6 +298,7 @@ class GatewayLocalService : Service() {
       400 -> "Bad Request"
       401 -> "Unauthorized"
       404 -> "Not Found"
+      500 -> "Internal Server Error"
       501 -> "Not Implemented"
       else -> "OK"
     }
@@ -289,6 +314,37 @@ class GatewayLocalService : Service() {
   private fun maskToken(token: String): String {
     if (token.length <= 8) return token
     return token.take(4) + "****" + token.takeLast(4)
+  }
+
+  private fun sendTelegramMessage(chatId: String, text: String): Boolean {
+    return try {
+      val endpoint = "https://api.telegram.org/bot$telegramBotToken/sendMessage"
+      val payload =
+        "chat_id=" + URLEncoder.encode(chatId, "UTF-8") +
+          "&text=" + URLEncoder.encode(text, "UTF-8")
+      val conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
+        requestMethod = "POST"
+        connectTimeout = 5000
+        readTimeout = 5000
+        doOutput = true
+        setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
+      }
+      conn.outputStream.use { it.write(payload.toByteArray()) }
+      val code = conn.responseCode
+      val body =
+        (if (code in 200..299) conn.inputStream else conn.errorStream)?.bufferedReader()?.use { it.readText() }
+          .orEmpty()
+      val ok = code in 200..299 && body.contains("\"ok\":true")
+      if (!ok) {
+        lastTelegramError = body.ifBlank { "sendMessage failed (code=$code)" }
+      } else {
+        lastTelegramError = ""
+      }
+      ok
+    } catch (t: Throwable) {
+      lastTelegramError = t.message ?: t.javaClass.simpleName
+      false
+    }
   }
 
   private fun ensureChannel() {
