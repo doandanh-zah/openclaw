@@ -8,8 +8,6 @@ class NodeApp : Application() {
 
   override fun onCreate() {
     super.onCreate()
-    // Experimental fork: keep Android-local gateway service alive without Termux/proot.
-    GatewayLocalService.start(this)
     if (BuildConfig.DEBUG) {
       StrictMode.setThreadPolicy(
         StrictMode.ThreadPolicy.Builder()
