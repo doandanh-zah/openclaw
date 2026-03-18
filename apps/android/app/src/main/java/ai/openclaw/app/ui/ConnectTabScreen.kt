@@ -43,6 +43,10 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -50,6 +54,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import ai.openclaw.app.LocalGatewayClient
 import ai.openclaw.app.MainViewModel
 import ai.openclaw.app.ui.mobileCardSurface
 
@@ -86,7 +91,12 @@ fun ConnectTabScreen(viewModel: MainViewModel) {
   var manualPortInput by rememberSaveable { mutableStateOf(manualPort.toString()) }
   var manualTlsInput by rememberSaveable { mutableStateOf(manualTls) }
   var passwordInput by rememberSaveable { mutableStateOf("") }
+  var tgBotTokenInput by rememberSaveable { mutableStateOf("") }
+  var tgChatIdInput by rememberSaveable { mutableStateOf("") }
+  var quickstartStatus by rememberSaveable { mutableStateOf("") }
+  var quickstartBusy by rememberSaveable { mutableStateOf(false) }
   var validationText by rememberSaveable { mutableStateOf<String?>(null) }
+  val scope = rememberCoroutineScope()
 
   if (pendingTrust != null) {
     val prompt = pendingTrust!!
@@ -188,6 +198,89 @@ fun ConnectTabScreen(viewModel: MainViewModel) {
             ),
         ) {
           Text("Use Local Gateway Now", style = mobileCallout.copy(fontWeight = FontWeight.Bold))
+        }
+      }
+    }
+
+    Surface(
+      modifier = Modifier.fillMaxWidth(),
+      shape = RoundedCornerShape(14.dp),
+      color = mobileCardSurface,
+      border = BorderStroke(1.dp, mobileBorder),
+    ) {
+      Column(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+      ) {
+        Text("Telegram Quick Setup", style = mobileHeadline, color = mobileText)
+        Text("Paste Bot Token + Chat ID, one tap to configure and start polling.", style = mobileCallout, color = mobileTextSecondary)
+
+        OutlinedTextField(
+          value = tgBotTokenInput,
+          onValueChange = { tgBotTokenInput = it },
+          placeholder = { Text("Bot token", style = mobileBody, color = mobileTextTertiary) },
+          modifier = Modifier.fillMaxWidth(),
+          singleLine = true,
+          keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
+          textStyle = mobileBody.copy(color = mobileText),
+          shape = RoundedCornerShape(12.dp),
+          colors = outlinedColors(),
+        )
+
+        OutlinedTextField(
+          value = tgChatIdInput,
+          onValueChange = { tgChatIdInput = it },
+          placeholder = { Text("Chat ID", style = mobileBody, color = mobileTextTertiary) },
+          modifier = Modifier.fillMaxWidth(),
+          singleLine = true,
+          keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
+          textStyle = mobileBody.copy(color = mobileText),
+          shape = RoundedCornerShape(12.dp),
+          colors = outlinedColors(),
+        )
+
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+          Button(
+            onClick = {
+              quickstartBusy = true
+              quickstartStatus = "Running quick setup..."
+              scope.launch {
+                val result = withContext(Dispatchers.IO) {
+                  LocalGatewayClient.quickstartTelegram(tgBotTokenInput.trim(), tgChatIdInput.trim())
+                }
+                quickstartBusy = false
+                quickstartStatus = if (result.first) "✅ Quick setup success" else "❌ Quick setup failed: ${result.second.take(120)}"
+              }
+            },
+            enabled = !quickstartBusy,
+            shape = RoundedCornerShape(12.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = mobileAccent, contentColor = Color.White),
+          ) {
+            Text("Setup & Start", style = mobileCaption1.copy(fontWeight = FontWeight.Bold))
+          }
+
+          Button(
+            onClick = {
+              quickstartBusy = true
+              quickstartStatus = "Sending test..."
+              scope.launch {
+                val result = withContext(Dispatchers.IO) {
+                  LocalGatewayClient.sendTelegramTest("[openclaw-local] test from one-tap UI")
+                }
+                quickstartBusy = false
+                quickstartStatus = if (result.first) "✅ Test message sent" else "❌ Send failed: ${result.second.take(120)}"
+              }
+            },
+            enabled = !quickstartBusy,
+            shape = RoundedCornerShape(12.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = mobileSuccess, contentColor = Color.White),
+          ) {
+            Text("Send Test", style = mobileCaption1.copy(fontWeight = FontWeight.Bold))
+          }
+        }
+
+        if (quickstartStatus.isNotBlank()) {
+          Text(quickstartStatus, style = mobileCaption1, color = mobileTextSecondary)
         }
       }
     }
