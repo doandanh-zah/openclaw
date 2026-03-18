@@ -40,6 +40,7 @@ class GatewayLocalService : Service() {
   private var serverThread: Thread? = null
   private var serverSocket: ServerSocket? = null
   private var telegramPollThread: Thread? = null
+  private var watchdogThread: Thread? = null
   @Volatile private var telegramPolling: Boolean = false
   private var telegramPollingRequested: Boolean = false
   private var telegramLastUpdateId: Long = 0L
@@ -75,6 +76,7 @@ class GatewayLocalService : Service() {
     if (telegramPollingRequested && telegramBotToken.isNotBlank()) {
       startTelegramPolling()
     }
+    startWatchdog()
   }
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -88,11 +90,23 @@ class GatewayLocalService : Service() {
   }
 
   override fun onDestroy() {
+    stopWatchdog()
     stopTelegramPolling()
     stopServer()
     isRunning.set(false)
     tokenRef.set("")
     super.onDestroy()
+  }
+
+  override fun onTrimMemory(level: Int) {
+    super.onTrimMemory(level)
+    if (level >= 10) {
+      lastInboundText = capText(lastInboundText, 120)
+      lastOutboundText = capText(lastOutboundText, 120)
+      if (lastTelegramError.length > 240) {
+        lastTelegramError = lastTelegramError.takeLast(240)
+      }
+    }
   }
 
   override fun onBind(intent: Intent?): IBinder? = null
@@ -129,6 +143,45 @@ class GatewayLocalService : Service() {
     serverSocket = null
     serverThread?.interrupt()
     serverThread = null
+  }
+
+  private fun startWatchdog() {
+    if (watchdogThread?.isAlive == true) return
+    watchdogThread =
+      thread(start = true, name = "openclaw-gateway-watchdog") {
+        while (!Thread.currentThread().isInterrupted) {
+          try {
+            val serverAlive = serverThread?.isAlive == true
+            if (!serverAlive) {
+              startServer()
+            }
+
+            if (telegramPollingRequested && telegramBotToken.isNotBlank()) {
+              val pollAlive = telegramPollThread?.isAlive == true
+              if (!pollAlive) {
+                startTelegramPolling()
+              }
+            }
+
+            updateNotification(
+              "Gateway :$PORT | poll=${if (telegramPolling) "on" else "off"} | handled=$telegramHandledCount",
+            )
+          } catch (t: Throwable) {
+            lastTelegramError = t.message ?: t.javaClass.simpleName
+          }
+
+          try {
+            Thread.sleep(5000)
+          } catch (_: InterruptedException) {
+            break
+          }
+        }
+      }
+  }
+
+  private fun stopWatchdog() {
+    watchdogThread?.interrupt()
+    watchdogThread = null
   }
 
   private fun handleClient(socket: java.net.Socket) {
@@ -299,9 +352,9 @@ class GatewayLocalService : Service() {
             if (text.isBlank()) {
               sendJson(out, 400, "{\"error\":\"invalid_payload\",\"need\":[\"text\"]}")
             } else {
-              lastInboundText = text
+              lastInboundText = capText(text)
               // Minimal pipeline: map inbound Telegram text into a local response.
-              lastOutboundText = "[android-local] received: $text"
+              lastOutboundText = capText("[android-local] received: $text")
               val sent = if (telegramBotToken.isNotBlank() && chat.isNotBlank()) sendTelegramMessage(chat, lastOutboundText) else false
               val payload =
                 "{\"ok\":true,\"received\":\"${escapeJson(text)}\",\"chatId\":\"${escapeJson(chat)}\",\"reply\":\"${escapeJson(lastOutboundText)}\",\"telegramSent\":$sent}"
@@ -320,7 +373,7 @@ class GatewayLocalService : Service() {
             } else {
               val sent = sendTelegramMessage(chat, text)
               if (sent) {
-                lastOutboundText = text
+                lastOutboundText = capText(text)
                 sendJson(out, 200, "{\"ok\":true,\"sent\":true}")
               } else {
                 sendJson(out, 500, "{\"ok\":false,\"sent\":false}")
@@ -424,6 +477,11 @@ class GatewayLocalService : Service() {
     return token.take(4) + "****" + token.takeLast(4)
   }
 
+  private fun capText(value: String, maxLen: Int = 500): String {
+    val trimmed = value.trim()
+    return if (trimmed.length <= maxLen) trimmed else trimmed.take(maxLen)
+  }
+
   private fun sendTelegramMessage(chatId: String, text: String): Boolean {
     return try {
       val endpoint = "https://api.telegram.org/bot$telegramBotToken/sendMessage"
@@ -498,19 +556,21 @@ class GatewayLocalService : Service() {
   }
 
   private fun handleIncomingTelegramMessage(chatId: String, text: String) {
-    lastInboundText = text
+    lastInboundText = capText(text)
     val trimmed = text.trim()
     lastOutboundText =
-      when {
-        trimmed.equals("/start", ignoreCase = true) ->
-          "✅ OpenClaw local gateway is online on Android. Send /status to check health."
-        trimmed.equals("/status", ignoreCase = true) ->
-          "📡 Gateway: running=${isRunning.get()} | polling=$telegramPolling | updateId=$telegramLastUpdateId"
-        trimmed.equals("/help", ignoreCase = true) ->
-          "Commands: /start /status /help"
-        else ->
-          "[android-local] received: $trimmed"
-      }
+      capText(
+        when {
+          trimmed.equals("/start", ignoreCase = true) ->
+            "✅ OpenClaw local gateway is online on Android. Send /status to check health."
+          trimmed.equals("/status", ignoreCase = true) ->
+            "📡 Gateway: running=${isRunning.get()} | polling=$telegramPolling | updateId=$telegramLastUpdateId"
+          trimmed.equals("/help", ignoreCase = true) ->
+            "Commands: /start /status /help"
+          else ->
+            "[android-local] received: $trimmed"
+        },
+      )
     sendTelegramMessage(chatId, lastOutboundText)
   }
 
