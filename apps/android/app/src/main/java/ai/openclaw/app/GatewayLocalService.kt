@@ -14,11 +14,16 @@ import java.io.BufferedReader
 import java.io.BufferedWriter
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
+import java.net.Inet4Address
 import java.net.HttpURLConnection
+import java.net.InetAddress
+import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.SocketException
 import java.net.URL
+import java.net.URLDecoder
 import java.net.URLEncoder
+import java.util.Collections
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
@@ -39,6 +44,8 @@ import kotlinx.serialization.json.jsonPrimitive
 class GatewayLocalService : Service() {
   private var serverThread: Thread? = null
   private var serverSocket: ServerSocket? = null
+  private var oauthCallbackThread: Thread? = null
+  private var oauthCallbackSocket: ServerSocket? = null
   private var telegramPollThread: Thread? = null
   private var watchdogThread: Thread? = null
   @Volatile private var telegramPolling: Boolean = false
@@ -51,12 +58,30 @@ class GatewayLocalService : Service() {
   private var localToken: String = ""
   private var telegramBotToken: String = ""
   private var telegramChatId: String = ""
+  private var gatewayNetworkMode: String = NETWORK_MODE_LOCAL
   private var oauthDeviceCode: String = ""
   private var oauthUserCode: String = ""
+  private var oauthVerificationUri: String = ""
+  private var oauthVerificationUriComplete: String = ""
   private var oauthAccessToken: String = ""
+  private var oauthRefreshToken: String = ""
+  private var oauthAccessExpiresAtMs: Long = 0L
+  private var oauthState: String = ""
+  private var oauthCodeVerifier: String = ""
+  private var oauthAccountId: String = ""
+  private var oauthAccountLabel: String = ""
+  private var oauthPending: Boolean = false
+  private var oauthLastError: String = ""
+  private var oauthStartedAtMs: Long = 0L
+  private var oauthCompletedAtMs: Long = 0L
   private var lastInboundText: String = ""
   private var lastOutboundText: String = ""
   private var lastTelegramError: String = ""
+  private var telegramLastTestOk: Boolean = false
+  private var telegramLastTestAtMs: Long = 0L
+  private var telegramLastTestMessage: String = ""
+  private val oauthLock = Any()
+  private val serverLock = Any()
 
   override fun onCreate() {
     super.onCreate()
@@ -64,16 +89,66 @@ class GatewayLocalService : Service() {
       ?: UUID.randomUUID().toString().replace("-", "")
     telegramBotToken = securePrefs.getString("gateway.local.telegram.botToken") ?: ""
     telegramChatId = prefs.getString("telegramChatId", "") ?: ""
+    gatewayNetworkMode = sanitizeNetworkMode(prefs.getString("gateway.local.networkMode", NETWORK_MODE_LOCAL))
+    oauthDeviceCode = prefs.getString("gateway.local.oauth.deviceCode", "") ?: ""
+    oauthUserCode = prefs.getString("gateway.local.oauth.userCode", "") ?: ""
+    oauthVerificationUri = prefs.getString("gateway.local.oauth.verificationUri", "") ?: ""
+    oauthVerificationUriComplete = prefs.getString("gateway.local.oauth.verificationUriComplete", "") ?: ""
     oauthAccessToken = securePrefs.getString("gateway.local.oauth.accessToken") ?: ""
+    oauthRefreshToken = securePrefs.getString("gateway.local.oauth.refreshToken") ?: ""
+    oauthAccessExpiresAtMs = prefs.getLong("gateway.local.oauth.accessExpiresAtMs", 0L)
+    oauthState = prefs.getString("gateway.local.oauth.state", "") ?: ""
+    oauthCodeVerifier = securePrefs.getString("gateway.local.oauth.codeVerifier") ?: ""
+    oauthAccountId = prefs.getString("gateway.local.oauth.accountId", "") ?: ""
+    oauthAccountLabel = prefs.getString("gateway.local.oauth.accountLabel", "") ?: ""
+    oauthPending = prefs.getBoolean("gateway.local.oauth.pending", false)
+    oauthLastError = prefs.getString("gateway.local.oauth.lastError", "") ?: ""
+    oauthStartedAtMs = prefs.getLong("gateway.local.oauth.startedAtMs", 0L)
+    oauthCompletedAtMs = prefs.getLong("gateway.local.oauth.completedAtMs", 0L)
     telegramLastUpdateId = prefs.getLong("telegramLastUpdateId", 0L)
     telegramHandledCount = prefs.getLong("telegramHandledCount", 0L)
     telegramPollingRequested = prefs.getBoolean("telegramPollingRequested", false)
+    lastInboundText = prefs.getString("gateway.local.telegram.lastInbound", "") ?: ""
+    lastOutboundText = prefs.getString("gateway.local.telegram.lastOutbound", "") ?: ""
+    lastTelegramError = prefs.getString("gateway.local.telegram.lastError", "") ?: ""
+    telegramLastTestOk = prefs.getBoolean("gateway.local.telegram.lastTestOk", false)
+    telegramLastTestAtMs = prefs.getLong("gateway.local.telegram.lastTestAtMs", 0L)
+    telegramLastTestMessage = prefs.getString("gateway.local.telegram.lastTestMessage", "") ?: ""
 
     securePrefs.putString("gateway.local.token", localToken)
     tokenRef.set(localToken)
+    if (oauthVerificationUri.startsWith("openclaw://")) {
+      oauthVerificationUri = ""
+    }
+    if (oauthVerificationUriComplete.startsWith("openclaw://")) {
+      oauthVerificationUriComplete = ""
+    }
+    if (oauthPending && (oauthState.isBlank() || oauthCodeVerifier.isBlank())) {
+      oauthPending = false
+      oauthDeviceCode = ""
+      oauthUserCode = ""
+      oauthVerificationUri = ""
+      oauthVerificationUriComplete = ""
+      oauthLastError = "ChatGPT login expired after restart. Start the QR login again."
+      persistOauthState()
+    }
+
     ensureChannel()
     startForeground(NOTIFICATION_ID, buildNotification("Starting local gateway…"))
     startServer()
+    if (oauthPending && !startOAuthCallbackListener()) {
+      oauthPending = false
+      oauthLastError =
+        oauthLastError.ifBlank {
+          "Could not resume the local OAuth callback listener on localhost:${OAUTH_CALLBACK_PORT}."
+        }
+      persistOauthState()
+    }
+    if (oauthRefreshToken.isNotBlank()) {
+      thread(start = true, name = "openclaw-oauth-refresh") {
+        maybeRefreshOAuthSessionIfNeeded()
+      }
+    }
     if (telegramPollingRequested && telegramBotToken.isNotBlank()) {
       startTelegramPolling()
     }
@@ -87,12 +162,16 @@ class GatewayLocalService : Service() {
         return START_NOT_STICKY
       }
     }
+    intent?.getStringExtra(EXTRA_NETWORK_MODE)?.let { requestedMode ->
+      applyGatewayNetworkMode(sanitizeNetworkMode(requestedMode))
+    }
     return START_STICKY
   }
 
   override fun onDestroy() {
     stopWatchdog()
     stopTelegramPolling()
+    stopOAuthCallbackListener()
     stopServer()
     isRunning.set(false)
     tokenRef.set("")
@@ -117,11 +196,13 @@ class GatewayLocalService : Service() {
 
     serverThread =
       thread(start = true, name = "openclaw-local-gateway") {
+        var ss: ServerSocket? = null
         try {
-          val ss = ServerSocket(PORT)
+          val bindHost = gatewayBindHost()
+          ss = ServerSocket(PORT, 50, InetAddress.getByName(bindHost))
           serverSocket = ss
           isRunning.set(true)
-          updateNotification("Local gateway listening on :$PORT")
+          updateNotification("Local gateway listening on ${gatewayBindLabel()}:$PORT")
 
           while (!Thread.currentThread().isInterrupted) {
             val socket = ss.accept()
@@ -131,19 +212,45 @@ class GatewayLocalService : Service() {
           // expected when socket closes during stop
         } catch (t: Throwable) {
           updateNotification("Gateway crashed: ${t.javaClass.simpleName}")
-          isRunning.set(false)
+        } finally {
+          synchronized(serverLock) {
+            if (serverSocket === ss) {
+              serverSocket = null
+              isRunning.set(false)
+            }
+          }
         }
       }
   }
 
   private fun stopServer() {
+    val socketToClose =
+      synchronized(serverLock) {
+        val current = serverSocket
+        serverSocket = null
+        isRunning.set(false)
+        current
+      }
     try {
-      serverSocket?.close()
+      socketToClose?.close()
     } catch (_: Throwable) {
     }
-    serverSocket = null
     serverThread?.interrupt()
     serverThread = null
+  }
+
+  private fun restartServer() {
+    stopServer()
+    startServer()
+  }
+
+  private fun applyGatewayNetworkMode(mode: String) {
+    if (mode == gatewayNetworkMode) return
+    gatewayNetworkMode = mode
+    prefs.edit { putString("gateway.local.networkMode", gatewayNetworkMode) }
+    if (serverThread?.isAlive == true || isRunning.get()) {
+      restartServer()
+    }
   }
 
   private fun startWatchdog() {
@@ -212,11 +319,7 @@ class GatewayLocalService : Service() {
       when {
         path == "/" -> sendText(out, 200, "OpenClaw Android local gateway alive\n")
         path == "/health" -> sendJson(out, 200, "{\"ok\":true,\"service\":\"gateway-local\"}")
-        path == "/status" -> {
-          val payload =
-            "{\"ok\":true,\"port\":$PORT,\"running\":${isRunning.get()},\"mode\":\"scaffold\",\"tokenReady\":${localToken.isNotBlank()},\"telegramConfigured\":${telegramBotToken.isNotBlank() && telegramChatId.isNotBlank()},\"oauthReady\":${oauthAccessToken.isNotBlank()}}"
-          sendJson(out, 200, payload)
-        }
+        path == "/status" -> sendJson(out, 200, baseStatusJson())
         path == "/token" && method == "GET" -> {
           val remote = s.inetAddress
           if (remote != null && !remote.isLoopbackAddress) {
@@ -225,29 +328,113 @@ class GatewayLocalService : Service() {
             sendJson(out, 200, "{\"token\":\"$localToken\"}")
           }
         }
+        path == "/v1/wizard/status" && method == "GET" -> {
+          if (!authorized(headers)) {
+            sendJson(out, 401, "{\"error\":\"unauthorized\"}")
+          } else {
+            maybeRefreshOAuthSessionIfNeeded()
+            sendJson(out, 200, wizardStatusJson())
+          }
+        }
         path == "/v1/oauth/device/start" && method == "POST" -> {
-          val clientId = jsonField(body, "clientId").ifBlank { "openclaw-android-local" }
-          oauthDeviceCode = UUID.randomUUID().toString().replace("-", "")
-          oauthUserCode = oauthDeviceCode.take(6).uppercase()
-          val payload =
-            "{\"ok\":true,\"clientId\":\"${escapeJson(clientId)}\",\"deviceCode\":\"$oauthDeviceCode\",\"userCode\":\"$oauthUserCode\",\"verificationUri\":\"openclaw://local-oauth\"}"
-          sendJson(out, 200, payload)
+          if (!authorized(headers)) {
+            sendJson(out, 401, "{\"error\":\"unauthorized\"}")
+          } else {
+            val clientId = jsonField(body, "clientId").ifBlank { "openclaw-android-local" }
+            val flow = OpenAICodexOAuth.createAuthorizationFlow()
+            stopOAuthCallbackListener()
+            oauthDeviceCode = flow.state
+            oauthUserCode = flow.state.take(6).uppercase()
+            oauthVerificationUri = OpenAICodexOAuth.AUTHORIZE_URL
+            oauthVerificationUriComplete = flow.authorizationUrl
+            oauthAccessToken = ""
+            oauthRefreshToken = ""
+            oauthAccessExpiresAtMs = 0L
+            oauthState = flow.state
+            oauthCodeVerifier = flow.verifier
+            oauthAccountId = ""
+            oauthAccountLabel = ""
+            oauthPending = true
+            oauthLastError = ""
+            oauthStartedAtMs = System.currentTimeMillis()
+            oauthCompletedAtMs = 0L
+            val callbackReady = startOAuthCallbackListener()
+            persistOauthState()
+            if (!callbackReady) {
+              oauthPending = false
+              oauthLastError = "Could not start the local OAuth callback listener on localhost:${OAUTH_CALLBACK_PORT}."
+              persistOauthState()
+              sendJson(
+                out,
+                500,
+                "{\"ok\":false,\"error\":\"oauth_callback_unavailable\",\"message\":\"${escapeJson(oauthLastError)}\"}",
+              )
+            } else {
+              val payload =
+                "{\"ok\":true,\"clientId\":\"${escapeJson(clientId)}\",\"deviceCode\":\"$oauthDeviceCode\",\"userCode\":\"$oauthUserCode\",\"verificationUri\":\"${escapeJson(oauthVerificationUri)}\",\"verificationUriComplete\":\"${escapeJson(oauthVerificationUriComplete)}\"}"
+              sendJson(out, 200, payload)
+            }
+          }
         }
         path == "/v1/oauth/device/complete" && method == "POST" -> {
-          val deviceCode = jsonField(body, "deviceCode")
-          if (deviceCode.isBlank() || deviceCode != oauthDeviceCode) {
-            sendJson(out, 400, "{\"ok\":false,\"error\":\"invalid_device_code\"}")
+          if (!authorized(headers)) {
+            sendJson(out, 401, "{\"error\":\"unauthorized\"}")
           } else {
-            oauthAccessToken = UUID.randomUUID().toString().replace("-", "")
-            securePrefs.putString("gateway.local.oauth.accessToken", oauthAccessToken)
-            sendJson(out, 200, "{\"ok\":true,\"accessToken\":\"$oauthAccessToken\",\"tokenType\":\"Bearer\"}")
+            if (oauthSessionReady()) {
+              sendJson(
+                out,
+                200,
+                "{\"ok\":true,\"message\":\"OAuth session already linked\",\"accountLabel\":\"${escapeJson(oauthAccountLabel)}\"}",
+              )
+            } else {
+              val callbackUrl = jsonField(body, "callbackUrl")
+              val manualCode = jsonField(body, "authorizationCode").ifBlank { jsonField(body, "code") }
+              val manualState = jsonField(body, "state").ifBlank { jsonField(body, "deviceCode") }
+              val parsed =
+                callbackUrl
+                  .takeIf { it.isNotBlank() }
+                  ?.let { OpenAICodexOAuth.parseAuthorizationInput(it) }
+              val result =
+                completePendingOAuth(
+                  code = parsed?.code ?: manualCode,
+                  state = parsed?.state ?: manualState,
+                )
+
+              result.fold(
+                onSuccess = {
+                  sendJson(
+                    out,
+                    200,
+                    "{\"ok\":true,\"message\":\"OAuth session saved\",\"accountLabel\":\"${escapeJson(oauthAccountLabel)}\"}",
+                  )
+                  stopOAuthCallbackListener()
+                },
+                onFailure = { error ->
+                  sendJson(
+                    out,
+                    400,
+                    "{\"ok\":false,\"error\":\"oauth_complete_failed\",\"message\":\"${escapeJson(error.message ?: "OAuth completion failed")}\"}",
+                  )
+                  stopOAuthCallbackListener()
+                },
+              )
+            }
           }
         }
         path == "/v1/oauth/status" && method == "GET" -> {
           if (!authorized(headers)) {
             sendJson(out, 401, "{\"error\":\"unauthorized\"}")
           } else {
-            sendJson(out, 200, "{\"ok\":true,\"ready\":${oauthAccessToken.isNotBlank()},\"userCode\":\"$oauthUserCode\"}")
+            maybeRefreshOAuthSessionIfNeeded()
+            sendJson(out, 200, oauthStatusJson())
+          }
+        }
+        path == "/v1/oauth/reset" && method == "POST" -> {
+          if (!authorized(headers)) {
+            sendJson(out, 401, "{\"error\":\"unauthorized\"}")
+          } else {
+            clearOauthState()
+            sendJson(out, 200, "{\"ok\":true,\"message\":\"OAuth state cleared\"}")
           }
         }
         path == "/v1/gateway/start" && method == "POST" -> {
@@ -261,7 +448,27 @@ class GatewayLocalService : Service() {
           if (!authorized(headers)) {
             sendJson(out, 401, "{\"error\":\"unauthorized\"}")
           } else {
-            sendJson(out, 200, "{\"ok\":true,\"running\":${isRunning.get()},\"port\":$PORT}")
+            sendJson(out, 200, gatewayStatusJson())
+          }
+        }
+        path == "/v1/gateway/network-mode" && method == "GET" -> {
+          if (!authorized(headers)) {
+            sendJson(out, 401, "{\"error\":\"unauthorized\"}")
+          } else {
+            sendJson(out, 200, gatewayStatusJson())
+          }
+        }
+        path == "/v1/gateway/network-mode" && method == "POST" -> {
+          if (!authorized(headers)) {
+            sendJson(out, 401, "{\"error\":\"unauthorized\"}")
+          } else {
+            val requestedMode = sanitizeNetworkMode(jsonField(body, "networkMode"))
+            applyGatewayNetworkMode(requestedMode)
+            sendJson(
+              out,
+              200,
+              gatewayStatusJson(message = "Gateway network mode updated to $requestedMode"),
+            )
           }
         }
         path == "/v1/config/telegram" && method == "POST" -> {
@@ -270,14 +477,23 @@ class GatewayLocalService : Service() {
           } else {
             val bot = jsonField(body, "botToken")
             val chat = jsonField(body, "chatId")
+            val startPolling = jsonBooleanField(body, "startPolling")
             if (bot.isBlank() || chat.isBlank()) {
               sendJson(out, 400, "{\"error\":\"invalid_payload\",\"need\":[\"botToken\",\"chatId\"]}")
             } else {
               telegramBotToken = bot
               telegramChatId = chat
-              securePrefs.putString("gateway.local.telegram.botToken", telegramBotToken)
-              prefs.edit { putString("telegramChatId", telegramChatId) }
-              sendJson(out, 200, "{\"ok\":true,\"configured\":true}")
+              persistTelegramConfig()
+              if (startPolling) {
+                telegramPollingRequested = true
+                prefs.edit { putBoolean("telegramPollingRequested", true) }
+                startTelegramPolling()
+              }
+              sendJson(
+                out,
+                200,
+                "{\"ok\":true,\"configured\":true,\"polling\":${telegramPolling || telegramPollingRequested},\"message\":\"Telegram config saved\"}",
+              )
             }
           }
         }
@@ -286,7 +502,11 @@ class GatewayLocalService : Service() {
             sendJson(out, 401, "{\"error\":\"unauthorized\"}")
           } else {
             val masked = maskToken(telegramBotToken)
-            sendJson(out, 200, "{\"ok\":true,\"configured\":${telegramBotToken.isNotBlank() && telegramChatId.isNotBlank()},\"botToken\":\"$masked\",\"chatId\":\"${telegramChatId}\",\"lastError\":\"${escapeJson(lastTelegramError)}\"}")
+            sendJson(
+              out,
+              200,
+              "{\"ok\":true,\"configured\":${telegramBotToken.isNotBlank() && telegramChatId.isNotBlank()},\"botToken\":\"$masked\",\"chatId\":\"${escapeJson(telegramChatId)}\",\"lastError\":\"${escapeJson(lastTelegramError)}\",\"polling\":$telegramPolling,\"lastTestOk\":$telegramLastTestOk,\"lastTestAtMs\":$telegramLastTestAtMs}",
+            )
           }
         }
         path == "/v1/setup/quickstart" && method == "POST" -> {
@@ -300,12 +520,11 @@ class GatewayLocalService : Service() {
             } else {
               telegramBotToken = bot
               telegramChatId = chat
-              securePrefs.putString("gateway.local.telegram.botToken", telegramBotToken)
-              prefs.edit { putString("telegramChatId", telegramChatId) }
+              persistTelegramConfig()
               telegramPollingRequested = true
               prefs.edit { putBoolean("telegramPollingRequested", true) }
               startTelegramPolling()
-              sendJson(out, 200, "{\"ok\":true,\"configured\":true,\"polling\":true}")
+              sendJson(out, 200, "{\"ok\":true,\"configured\":true,\"polling\":true,\"message\":\"Telegram quickstart complete\"}")
             }
           }
         }
@@ -335,7 +554,19 @@ class GatewayLocalService : Service() {
           if (!authorized(headers)) {
             sendJson(out, 401, "{\"error\":\"unauthorized\"}")
           } else {
-            sendJson(out, 200, "{\"ok\":true,\"polling\":$telegramPolling,\"requested\":$telegramPollingRequested,\"lastUpdateId\":$telegramLastUpdateId,\"handled\":$telegramHandledCount}")
+            sendJson(
+              out,
+              200,
+              "{\"ok\":true,\"polling\":$telegramPolling,\"requested\":$telegramPollingRequested,\"configured\":${telegramBotToken.isNotBlank() && telegramChatId.isNotBlank()},\"lastUpdateId\":$telegramLastUpdateId,\"handled\":$telegramHandledCount,\"lastError\":\"${escapeJson(lastTelegramError)}\"}",
+            )
+          }
+        }
+        path == "/v1/telegram/reset" && method == "POST" -> {
+          if (!authorized(headers)) {
+            sendJson(out, 401, "{\"error\":\"unauthorized\"}")
+          } else {
+            clearTelegramState()
+            sendJson(out, 200, "{\"ok\":true,\"message\":\"Telegram config cleared\"}")
           }
         }
         path == "/v1/session" && method == "GET" -> {
@@ -355,6 +586,7 @@ class GatewayLocalService : Service() {
               sendJson(out, 400, "{\"error\":\"invalid_payload\",\"need\":[\"text\"]}")
             } else {
               lastInboundText = capText(text)
+              persistTelegramDiagnostics()
               // Minimal pipeline: map inbound Telegram text into a local response.
               lastOutboundText = capText("[android-local] received: $text")
               val sent = if (telegramBotToken.isNotBlank() && chat.isNotBlank()) sendTelegramMessage(chat, lastOutboundText) else false
@@ -376,9 +608,21 @@ class GatewayLocalService : Service() {
               val sent = sendTelegramMessage(chat, text)
               if (sent) {
                 lastOutboundText = capText(text)
-                sendJson(out, 200, "{\"ok\":true,\"sent\":true}")
+                telegramLastTestOk = true
+                telegramLastTestAtMs = System.currentTimeMillis()
+                telegramLastTestMessage = "Test message sent"
+                persistTelegramDiagnostics()
+                sendJson(out, 200, "{\"ok\":true,\"sent\":true,\"message\":\"Telegram test sent\"}")
               } else {
-                sendJson(out, 500, "{\"ok\":false,\"sent\":false}")
+                telegramLastTestOk = false
+                telegramLastTestAtMs = System.currentTimeMillis()
+                telegramLastTestMessage = lastTelegramError.ifBlank { "Telegram send failed" }
+                persistTelegramDiagnostics()
+                sendJson(
+                  out,
+                  500,
+                  "{\"ok\":false,\"sent\":false,\"message\":\"${escapeJson(telegramLastTestMessage)}\"}",
+                )
               }
             }
           }
@@ -432,7 +676,391 @@ class GatewayLocalService : Service() {
 
   private fun authorized(headers: Map<String, String>): Boolean {
     val auth = headers["authorization"].orEmpty()
-    return auth == "Bearer $localToken" || (oauthAccessToken.isNotBlank() && auth == "Bearer $oauthAccessToken")
+    return auth == "Bearer $localToken"
+  }
+
+  private fun baseStatusJson(): String =
+    "{\"ok\":true," +
+      "\"port\":$PORT," +
+      "\"running\":${isRunning.get()}," +
+      "\"mode\":\"scaffold\"," +
+      "\"tokenReady\":${localToken.isNotBlank()}," +
+      "\"telegramConfigured\":${telegramBotToken.isNotBlank() && telegramChatId.isNotBlank()}," +
+      "\"telegramPolling\":$telegramPolling," +
+      "\"oauthReady\":${oauthSessionReady()}," +
+      "\"oauthPending\":$oauthPending," +
+      "\"networkMode\":\"${escapeJson(gatewayNetworkMode)}\"," +
+      "\"bindHost\":\"${escapeJson(gatewayBindLabel())}\"," +
+      "\"localUrl\":\"${escapeJson(localGatewayUrl())}\"," +
+      "\"lanUrl\":\"${escapeJson(lanGatewayUrl())}\"" +
+      "}"
+
+  private fun gatewayStatusJson(message: String = ""): String =
+    "{\"ok\":true," +
+      "\"running\":${isRunning.get()}," +
+      "\"port\":$PORT," +
+      "\"networkMode\":\"${escapeJson(gatewayNetworkMode)}\"," +
+      "\"bindHost\":\"${escapeJson(gatewayBindLabel())}\"," +
+      "\"localUrl\":\"${escapeJson(localGatewayUrl())}\"," +
+      "\"lanUrl\":\"${escapeJson(lanGatewayUrl())}\"," +
+      "\"message\":\"${escapeJson(message)}\"" +
+      "}"
+
+  private fun wizardStatusJson(): String =
+    "{\"ok\":true," +
+      "\"gateway\":{" +
+      "\"running\":${isRunning.get()}," +
+      "\"port\":$PORT," +
+      "\"tokenReady\":${localToken.isNotBlank()}," +
+      "\"networkMode\":\"${escapeJson(gatewayNetworkMode)}\"," +
+      "\"bindHost\":\"${escapeJson(gatewayBindLabel())}\"," +
+      "\"localUrl\":\"${escapeJson(localGatewayUrl())}\"," +
+      "\"lanUrl\":\"${escapeJson(lanGatewayUrl())}\"" +
+      "}," +
+      "\"oauth\":{" +
+      "\"ready\":${oauthSessionReady()}," +
+      "\"pending\":$oauthPending," +
+      "\"deviceCode\":\"${escapeJson(oauthDeviceCode)}\"," +
+      "\"userCode\":\"${escapeJson(oauthUserCode)}\"," +
+      "\"verificationUri\":\"${escapeJson(oauthVerificationUri)}\"," +
+      "\"verificationUriComplete\":\"${escapeJson(oauthVerificationUriComplete)}\"," +
+      "\"accountId\":\"${escapeJson(oauthAccountId)}\"," +
+      "\"accountLabel\":\"${escapeJson(oauthAccountLabel)}\"," +
+      "\"hasRefreshToken\":${oauthRefreshToken.isNotBlank()}," +
+      "\"accessExpiresAtMs\":$oauthAccessExpiresAtMs," +
+      "\"callbackListening\":${oauthCallbackThread?.isAlive == true}," +
+      "\"lastError\":\"${escapeJson(oauthLastError)}\"," +
+      "\"startedAtMs\":$oauthStartedAtMs," +
+      "\"completedAtMs\":$oauthCompletedAtMs" +
+      "}," +
+      "\"telegram\":{" +
+      "\"configured\":${telegramBotToken.isNotBlank() && telegramChatId.isNotBlank()}," +
+      "\"polling\":$telegramPolling," +
+      "\"requested\":$telegramPollingRequested," +
+      "\"chatId\":\"${escapeJson(telegramChatId)}\"," +
+      "\"botTokenMasked\":\"${escapeJson(maskToken(telegramBotToken))}\"," +
+      "\"handled\":$telegramHandledCount," +
+      "\"lastError\":\"${escapeJson(lastTelegramError)}\"," +
+      "\"lastInbound\":\"${escapeJson(lastInboundText)}\"," +
+      "\"lastOutbound\":\"${escapeJson(lastOutboundText)}\"," +
+      "\"lastTestOk\":$telegramLastTestOk," +
+      "\"lastTestAtMs\":$telegramLastTestAtMs," +
+      "\"lastTestMessage\":\"${escapeJson(telegramLastTestMessage)}\"" +
+      "}" +
+      "}"
+
+  private fun oauthStatusJson(): String =
+    "{\"ok\":true," +
+      "\"ready\":${oauthSessionReady()}," +
+      "\"pending\":$oauthPending," +
+      "\"deviceCode\":\"${escapeJson(oauthDeviceCode)}\"," +
+      "\"userCode\":\"${escapeJson(oauthUserCode)}\"," +
+      "\"verificationUri\":\"${escapeJson(oauthVerificationUri)}\"," +
+      "\"verificationUriComplete\":\"${escapeJson(oauthVerificationUriComplete)}\"," +
+      "\"accountId\":\"${escapeJson(oauthAccountId)}\"," +
+      "\"accountLabel\":\"${escapeJson(oauthAccountLabel)}\"," +
+      "\"hasRefreshToken\":${oauthRefreshToken.isNotBlank()}," +
+      "\"accessExpiresAtMs\":$oauthAccessExpiresAtMs," +
+      "\"callbackListening\":${oauthCallbackThread?.isAlive == true}," +
+      "\"lastError\":\"${escapeJson(oauthLastError)}\"," +
+      "\"startedAtMs\":$oauthStartedAtMs," +
+      "\"completedAtMs\":$oauthCompletedAtMs" +
+      "}"
+
+  private fun persistOauthState() {
+    securePrefs.putString("gateway.local.oauth.accessToken", oauthAccessToken)
+    securePrefs.putString("gateway.local.oauth.refreshToken", oauthRefreshToken)
+    securePrefs.putString("gateway.local.oauth.codeVerifier", oauthCodeVerifier)
+    prefs.edit {
+      putString("gateway.local.oauth.deviceCode", oauthDeviceCode)
+      putString("gateway.local.oauth.userCode", oauthUserCode)
+      putString("gateway.local.oauth.verificationUri", oauthVerificationUri)
+      putString("gateway.local.oauth.verificationUriComplete", oauthVerificationUriComplete)
+      putString("gateway.local.oauth.state", oauthState)
+      putString("gateway.local.oauth.accountId", oauthAccountId)
+      putString("gateway.local.oauth.accountLabel", oauthAccountLabel)
+      putBoolean("gateway.local.oauth.pending", oauthPending)
+      putString("gateway.local.oauth.lastError", oauthLastError)
+      putLong("gateway.local.oauth.accessExpiresAtMs", oauthAccessExpiresAtMs)
+      putLong("gateway.local.oauth.startedAtMs", oauthStartedAtMs)
+      putLong("gateway.local.oauth.completedAtMs", oauthCompletedAtMs)
+    }
+  }
+
+  private fun clearOauthState() {
+    stopOAuthCallbackListener()
+    oauthDeviceCode = ""
+    oauthUserCode = ""
+    oauthVerificationUri = ""
+    oauthVerificationUriComplete = ""
+    oauthAccessToken = ""
+    oauthRefreshToken = ""
+    oauthAccessExpiresAtMs = 0L
+    oauthState = ""
+    oauthCodeVerifier = ""
+    oauthAccountId = ""
+    oauthAccountLabel = ""
+    oauthPending = false
+    oauthLastError = ""
+    oauthStartedAtMs = 0L
+    oauthCompletedAtMs = 0L
+    securePrefs.remove("gateway.local.oauth.accessToken")
+    securePrefs.remove("gateway.local.oauth.refreshToken")
+    securePrefs.remove("gateway.local.oauth.codeVerifier")
+    persistOauthState()
+  }
+
+  private fun oauthSessionReady(): Boolean {
+    return oauthAccessToken.isNotBlank() &&
+      oauthAccessExpiresAtMs > System.currentTimeMillis() + OAUTH_EXPIRY_SKEW_MS
+  }
+
+  private fun maybeRefreshOAuthSessionIfNeeded(force: Boolean = false): Boolean {
+    synchronized(oauthLock) {
+      if (oauthPending || oauthRefreshToken.isBlank()) {
+        return oauthSessionReady()
+      }
+      if (!force && oauthSessionReady()) {
+        return true
+      }
+      return OpenAICodexOAuth.refreshAccessToken(oauthRefreshToken).fold(
+        onSuccess = { tokens ->
+          applyOAuthTokens(tokens)
+          true
+        },
+        onFailure = { error ->
+          oauthAccessToken = ""
+          oauthAccessExpiresAtMs = 0L
+          oauthLastError = error.message ?: "OAuth refresh failed"
+          persistOauthState()
+          false
+        },
+      )
+    }
+  }
+
+  private fun applyOAuthTokens(tokens: OpenAICodexTokens) {
+    oauthAccessToken = tokens.access
+    oauthRefreshToken = tokens.refresh
+    oauthAccessExpiresAtMs = tokens.expiresAtMs
+    oauthAccountId = tokens.accountId
+    oauthAccountLabel = tokens.accountId
+    oauthPending = false
+    oauthLastError = ""
+    oauthCompletedAtMs = System.currentTimeMillis()
+    oauthState = ""
+    oauthCodeVerifier = ""
+    oauthDeviceCode = ""
+    oauthUserCode = ""
+    oauthVerificationUri = ""
+    oauthVerificationUriComplete = ""
+    persistOauthState()
+  }
+
+  private fun completePendingOAuth(code: String?, state: String?): Result<Unit> {
+    return runCatching {
+      synchronized(oauthLock) {
+        val authorizationCode = code?.trim().orEmpty()
+        val returnedState = state?.trim().orEmpty()
+        if (authorizationCode.isBlank()) {
+          error("Missing authorization code from OAuth callback.")
+        }
+        if (!oauthPending || oauthState.isBlank() || oauthCodeVerifier.isBlank()) {
+          error("No active ChatGPT login is waiting for completion.")
+        }
+        if (returnedState.isBlank() || returnedState != oauthState) {
+          error("OAuth state mismatch. Create a fresh QR and try again.")
+        }
+
+        val tokens =
+          OpenAICodexOAuth.exchangeAuthorizationCode(
+            code = authorizationCode,
+            verifier = oauthCodeVerifier,
+          ).getOrElse { throw it }
+        applyOAuthTokens(tokens)
+      }
+    }.onFailure { error ->
+      oauthPending = false
+      oauthAccessToken = ""
+      oauthAccessExpiresAtMs = 0L
+      oauthState = ""
+      oauthCodeVerifier = ""
+      oauthDeviceCode = ""
+      oauthUserCode = ""
+      oauthVerificationUri = ""
+      oauthVerificationUriComplete = ""
+      oauthLastError = error.message ?: "OAuth completion failed"
+      persistOauthState()
+    }
+  }
+
+  private fun startOAuthCallbackListener(): Boolean {
+    synchronized(oauthLock) {
+      if (oauthCallbackThread?.isAlive == true) {
+        return true
+      }
+      return try {
+        val server = ServerSocket(OAUTH_CALLBACK_PORT).apply {
+          reuseAddress = true
+        }
+        oauthCallbackSocket = server
+        oauthCallbackThread =
+          thread(start = true, name = "openclaw-oauth-callback") {
+            try {
+              while (!Thread.currentThread().isInterrupted) {
+                val socket = server.accept()
+                handleOAuthCallback(socket)
+              }
+            } catch (_: SocketException) {
+              // expected while shutting down the callback listener
+            } catch (t: Throwable) {
+              oauthLastError = t.message ?: "OAuth callback listener crashed"
+              persistOauthState()
+            } finally {
+              try {
+                server.close()
+              } catch (_: Throwable) {
+              }
+            }
+          }
+        true
+      } catch (t: Throwable) {
+        oauthCallbackSocket = null
+        oauthCallbackThread = null
+        oauthLastError = t.message ?: "OAuth callback listener failed"
+        false
+      }
+    }
+  }
+
+  private fun stopOAuthCallbackListener() {
+    synchronized(oauthLock) {
+      try {
+        oauthCallbackSocket?.close()
+      } catch (_: Throwable) {
+      }
+      oauthCallbackSocket = null
+      oauthCallbackThread?.interrupt()
+      oauthCallbackThread = null
+    }
+  }
+
+  private fun handleOAuthCallback(socket: java.net.Socket) {
+    socket.use { s ->
+      val remote = s.inetAddress
+      val reader = BufferedReader(InputStreamReader(s.getInputStream()))
+      val out = BufferedWriter(OutputStreamWriter(s.getOutputStream()))
+      val requestLine = reader.readLine() ?: return
+      val parts = requestLine.split(" ")
+      val method = parts.getOrNull(0) ?: "GET"
+      val target = parts.getOrNull(1) ?: "/"
+
+      while (true) {
+        val line = reader.readLine() ?: break
+        if (line.isBlank()) break
+      }
+
+      if (remote != null && !remote.isLoopbackAddress) {
+        sendHtml(out, 401, buildErrorHtml("OAuth callback is only accepted from localhost."))
+        return
+      }
+
+      val callbackPath = target.substringBefore('?')
+      val query = target.substringAfter('?', "")
+      if (method != "GET") {
+        sendHtml(out, 405, buildErrorHtml("Unsupported OAuth callback method."))
+        return
+      }
+      if (callbackPath != OAUTH_CALLBACK_PATH) {
+        sendHtml(out, 404, buildErrorHtml("OAuth callback path was not found."))
+        return
+      }
+
+      val providerError = queryField(query, "error")
+      val providerErrorDescription = queryField(query, "error_description")
+      if (providerError.isNotBlank()) {
+        val message =
+          providerErrorDescription.ifBlank { providerError }.ifBlank { "OAuth login was cancelled." }
+        oauthPending = false
+        oauthState = ""
+        oauthCodeVerifier = ""
+        oauthDeviceCode = ""
+        oauthUserCode = ""
+        oauthVerificationUri = ""
+        oauthVerificationUriComplete = ""
+        oauthLastError = message
+        persistOauthState()
+        sendHtml(out, 400, buildErrorHtml(message))
+        stopOAuthCallbackListener()
+        return
+      }
+
+      val result =
+        completePendingOAuth(
+          code = queryField(query, "code"),
+          state = queryField(query, "state"),
+        )
+
+      result.fold(
+        onSuccess = {
+          sendHtml(out, 200, OpenAICodexOAuth.SUCCESS_HTML)
+          stopOAuthCallbackListener()
+        },
+        onFailure = { error ->
+          sendHtml(
+            out,
+            400,
+            buildErrorHtml(error.message ?: "OAuth callback failed. Return to the app and create a fresh QR."),
+          )
+          stopOAuthCallbackListener()
+        },
+      )
+    }
+  }
+
+  private fun persistTelegramConfig() {
+    securePrefs.putString("gateway.local.telegram.botToken", telegramBotToken)
+    prefs.edit { putString("telegramChatId", telegramChatId) }
+    persistTelegramDiagnostics()
+  }
+
+  private fun persistTelegramDiagnostics() {
+    prefs.edit {
+      putString("gateway.local.telegram.lastInbound", lastInboundText)
+      putString("gateway.local.telegram.lastOutbound", lastOutboundText)
+      putString("gateway.local.telegram.lastError", lastTelegramError)
+      putBoolean("gateway.local.telegram.lastTestOk", telegramLastTestOk)
+      putLong("gateway.local.telegram.lastTestAtMs", telegramLastTestAtMs)
+      putString("gateway.local.telegram.lastTestMessage", telegramLastTestMessage)
+    }
+  }
+
+  private fun clearTelegramState() {
+    stopTelegramPolling()
+    telegramPollingRequested = false
+    telegramBotToken = ""
+    telegramChatId = ""
+    telegramLastUpdateId = 0L
+    telegramHandledCount = 0L
+    lastInboundText = ""
+    lastOutboundText = ""
+    lastTelegramError = ""
+    telegramLastTestOk = false
+    telegramLastTestAtMs = 0L
+    telegramLastTestMessage = ""
+    securePrefs.remove("gateway.local.telegram.botToken")
+    prefs.edit {
+      putString("telegramChatId", "")
+      putBoolean("telegramPollingRequested", false)
+      putLong("telegramLastUpdateId", 0L)
+      putLong("telegramHandledCount", 0L)
+      putString("gateway.local.telegram.lastInbound", "")
+      putString("gateway.local.telegram.lastOutbound", "")
+      putString("gateway.local.telegram.lastError", "")
+      putBoolean("gateway.local.telegram.lastTestOk", false)
+      putLong("gateway.local.telegram.lastTestAtMs", 0L)
+      putString("gateway.local.telegram.lastTestMessage", "")
+    }
   }
 
   private fun sendText(out: BufferedWriter, status: Int, body: String) {
@@ -455,14 +1083,27 @@ class GatewayLocalService : Service() {
     out.flush()
   }
 
+  private fun sendHtml(out: BufferedWriter, status: Int, body: String) {
+    val bytes = body.toByteArray()
+    out.write("HTTP/1.1 $status ${statusText(status)}\r\n")
+    out.write("Content-Type: text/html; charset=utf-8\r\n")
+    out.write("Content-Length: ${bytes.size}\r\n")
+    out.write("Connection: close\r\n\r\n")
+    out.write(body)
+    out.flush()
+  }
+
   private fun statusText(code: Int): String =
     when (code) {
       200 -> "OK"
       400 -> "Bad Request"
       401 -> "Unauthorized"
+      405 -> "Method Not Allowed"
+      409 -> "Conflict"
       404 -> "Not Found"
       500 -> "Internal Server Error"
       501 -> "Not Implemented"
+      503 -> "Service Unavailable"
       else -> "OK"
     }
 
@@ -471,8 +1112,91 @@ class GatewayLocalService : Service() {
     return re.find(body)?.groupValues?.getOrNull(1)?.trim().orEmpty()
   }
 
+  private fun jsonBooleanField(body: String, key: String): Boolean {
+    val re = Regex("\"$key\"\\s*:\\s*(true|false)")
+    return re.find(body)?.groupValues?.getOrNull(1)?.equals("true", ignoreCase = true) == true
+  }
+
   private fun escapeJson(value: String): String =
     value.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
+
+  private fun escapeHtml(value: String): String =
+    value
+      .replace("&", "&amp;")
+      .replace("<", "&lt;")
+      .replace(">", "&gt;")
+      .replace("\"", "&quot;")
+
+  private fun buildErrorHtml(message: String): String =
+    "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\" />" +
+      "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />" +
+      "<title>Authentication failed</title></head><body>" +
+      "<p>${escapeHtml(message)}</p></body></html>"
+
+  private fun queryField(query: String, key: String): String {
+    if (query.isBlank()) return ""
+    val prefix = "$key="
+    return query
+      .split("&")
+      .firstOrNull { it.startsWith(prefix) }
+      ?.substringAfter('=')
+      ?.let { URLDecoder.decode(it, "UTF-8") }
+      ?.trim()
+      .orEmpty()
+  }
+
+  private fun urlEncode(value: String): String = URLEncoder.encode(value, "UTF-8")
+
+  private fun gatewayBindHost(): String =
+    when (gatewayNetworkMode) {
+      NETWORK_MODE_LAN -> "0.0.0.0"
+      else -> "127.0.0.1"
+    }
+
+  private fun gatewayBindLabel(): String =
+    when (gatewayNetworkMode) {
+      NETWORK_MODE_LAN -> "0.0.0.0"
+      else -> "127.0.0.1"
+    }
+
+  private fun localGatewayUrl(): String = "http://127.0.0.1:$PORT"
+
+  private fun lanGatewayUrl(): String {
+    val host = discoverLanIpv4Address().ifBlank { return "" }
+    return "http://$host:$PORT"
+  }
+
+  private fun discoverLanIpv4Address(): String {
+    return try {
+      val interfaces =
+        NetworkInterface.getNetworkInterfaces()?.let { Collections.list(it) }.orEmpty()
+      val siteLocal =
+        interfaces
+          .asSequence()
+          .filter { it.isUp && !it.isLoopback && !it.isVirtual }
+          .flatMap { iface -> Collections.list(iface.inetAddresses).asSequence() }
+          .filterIsInstance<Inet4Address>()
+          .filter { !it.isLoopbackAddress && !it.hostAddress.orEmpty().startsWith("169.254.") }
+          .firstOrNull { it.isSiteLocalAddress }
+      val fallback =
+        interfaces
+          .asSequence()
+          .filter { it.isUp && !it.isLoopback && !it.isVirtual }
+          .flatMap { iface -> Collections.list(iface.inetAddresses).asSequence() }
+          .filterIsInstance<Inet4Address>()
+          .firstOrNull { !it.isLoopbackAddress && !it.hostAddress.orEmpty().startsWith("169.254.") }
+      (siteLocal ?: fallback)?.hostAddress.orEmpty()
+    } catch (_: Throwable) {
+      ""
+    }
+  }
+
+  private fun sanitizeNetworkMode(value: String?): String {
+    return when (value?.trim()?.lowercase()) {
+      NETWORK_MODE_LAN -> NETWORK_MODE_LAN
+      else -> NETWORK_MODE_LOCAL
+    }
+  }
 
   private fun maskToken(token: String): String {
     if (token.length <= 8) return token
@@ -508,9 +1232,11 @@ class GatewayLocalService : Service() {
       } else {
         lastTelegramError = ""
       }
+      persistTelegramDiagnostics()
       ok
     } catch (t: Throwable) {
       lastTelegramError = t.message ?: t.javaClass.simpleName
+      persistTelegramDiagnostics()
       false
     }
   }
@@ -573,6 +1299,7 @@ class GatewayLocalService : Service() {
             "[android-local] received: $trimmed"
         },
       )
+    persistTelegramDiagnostics()
     sendTelegramMessage(chatId, lastOutboundText)
   }
 
@@ -593,6 +1320,7 @@ class GatewayLocalService : Service() {
         .orEmpty()
     if (code !in 200..299 || !body.contains("\"ok\":true")) {
       if (body.isNotBlank()) lastTelegramError = body
+      persistTelegramDiagnostics()
       return emptyList()
     }
 
@@ -668,6 +1396,12 @@ class GatewayLocalService : Service() {
     private const val CHANNEL_ID = "gateway-local"
     private const val NOTIFICATION_ID = 41
     private const val ACTION_STOP = "ai.openclaw.app.action.GATEWAY_LOCAL_STOP"
+    private const val EXTRA_NETWORK_MODE = "ai.openclaw.app.extra.GATEWAY_NETWORK_MODE"
+    private const val OAUTH_CALLBACK_PORT = 1455
+    private const val OAUTH_CALLBACK_PATH = "/auth/callback"
+    private const val OAUTH_EXPIRY_SKEW_MS = 60_000L
+    const val NETWORK_MODE_LOCAL = "local"
+    const val NETWORK_MODE_LAN = "lan"
     const val PORT = 18789
 
     private val isRunning = AtomicBoolean(false)
@@ -677,8 +1411,13 @@ class GatewayLocalService : Service() {
 
     fun currentToken(): String = tokenRef.get()
 
-    fun start(context: Context) {
-      val intent = Intent(context, GatewayLocalService::class.java)
+    fun start(context: Context, networkMode: String? = null) {
+      val intent =
+        Intent(context, GatewayLocalService::class.java).apply {
+          networkMode?.trim()?.takeIf { it.isNotEmpty() }?.let {
+            putExtra(EXTRA_NETWORK_MODE, it)
+          }
+        }
       context.startForegroundService(intent)
     }
 

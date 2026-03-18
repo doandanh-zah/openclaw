@@ -249,7 +249,12 @@ fun ConnectTabScreen(viewModel: MainViewModel) {
                   LocalGatewayClient.quickstartTelegram(tgBotTokenInput.trim(), tgChatIdInput.trim())
                 }
                 quickstartBusy = false
-                quickstartStatus = if (result.first) "✅ Quick setup success" else "❌ Quick setup failed: ${result.second.take(120)}"
+                quickstartStatus =
+                  if (result.ok) {
+                    "✅ Quick setup success"
+                  } else {
+                    "❌ Quick setup failed: ${result.message.take(120)}"
+                  }
               }
             },
             enabled = !quickstartBusy,
@@ -268,7 +273,12 @@ fun ConnectTabScreen(viewModel: MainViewModel) {
                   LocalGatewayClient.sendTelegramTest("[openclaw-local] test from one-tap UI")
                 }
                 quickstartBusy = false
-                quickstartStatus = if (result.first) "✅ Test message sent" else "❌ Send failed: ${result.second.take(120)}"
+                quickstartStatus =
+                  if (result.ok) {
+                    "✅ Test message sent"
+                  } else {
+                    "❌ Send failed: ${result.message.take(120)}"
+                  }
               }
             },
             enabled = !quickstartBusy,
