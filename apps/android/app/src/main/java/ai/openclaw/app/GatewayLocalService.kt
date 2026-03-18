@@ -41,7 +41,9 @@ class GatewayLocalService : Service() {
   private var serverSocket: ServerSocket? = null
   private var telegramPollThread: Thread? = null
   @Volatile private var telegramPolling: Boolean = false
+  private var telegramPollingRequested: Boolean = false
   private var telegramLastUpdateId: Long = 0L
+  private var telegramHandledCount: Long = 0L
   private val prefs by lazy { applicationContext.getSharedPreferences("openclaw.gateway.local", Context.MODE_PRIVATE) }
   private val json = Json { ignoreUnknownKeys = true }
   private var localToken: String = ""
@@ -62,12 +64,17 @@ class GatewayLocalService : Service() {
     telegramChatId = prefs.getString("telegramChatId", "") ?: ""
     oauthAccessToken = prefs.getString("oauthAccessToken", "") ?: ""
     telegramLastUpdateId = prefs.getLong("telegramLastUpdateId", 0L)
+    telegramHandledCount = prefs.getLong("telegramHandledCount", 0L)
+    telegramPollingRequested = prefs.getBoolean("telegramPollingRequested", false)
 
     prefs.edit { putString("localToken", localToken) }
     tokenRef.set(localToken)
     ensureChannel()
     startForeground(NOTIFICATION_ID, buildNotification("Starting local gateway…"))
     startServer()
+    if (telegramPollingRequested && telegramBotToken.isNotBlank()) {
+      startTelegramPolling()
+    }
   }
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -240,6 +247,8 @@ class GatewayLocalService : Service() {
                 putString("telegramBotToken", telegramBotToken)
                 putString("telegramChatId", telegramChatId)
               }
+              telegramPollingRequested = true
+              prefs.edit { putBoolean("telegramPollingRequested", true) }
               startTelegramPolling()
               sendJson(out, 200, "{\"ok\":true,\"configured\":true,\"polling\":true}")
             }
@@ -251,6 +260,8 @@ class GatewayLocalService : Service() {
           } else if (telegramBotToken.isBlank()) {
             sendJson(out, 400, "{\"error\":\"telegram_not_configured\"}")
           } else {
+            telegramPollingRequested = true
+            prefs.edit { putBoolean("telegramPollingRequested", true) }
             startTelegramPolling()
             sendJson(out, 200, "{\"ok\":true,\"polling\":true}")
           }
@@ -259,6 +270,8 @@ class GatewayLocalService : Service() {
           if (!authorized(headers)) {
             sendJson(out, 401, "{\"error\":\"unauthorized\"}")
           } else {
+            telegramPollingRequested = false
+            prefs.edit { putBoolean("telegramPollingRequested", false) }
             stopTelegramPolling()
             sendJson(out, 200, "{\"ok\":true,\"polling\":false}")
           }
@@ -267,7 +280,7 @@ class GatewayLocalService : Service() {
           if (!authorized(headers)) {
             sendJson(out, 401, "{\"error\":\"unauthorized\"}")
           } else {
-            sendJson(out, 200, "{\"ok\":true,\"polling\":$telegramPolling,\"lastUpdateId\":$telegramLastUpdateId}")
+            sendJson(out, 200, "{\"ok\":true,\"polling\":$telegramPolling,\"requested\":$telegramPollingRequested,\"lastUpdateId\":$telegramLastUpdateId,\"handled\":$telegramHandledCount}")
           }
         }
         path == "/v1/session" && method == "GET" -> {
@@ -447,24 +460,33 @@ class GatewayLocalService : Service() {
     telegramPolling = true
     telegramPollThread =
       thread(start = true, name = "openclaw-telegram-poll") {
+        var backoffMs = 1500L
         while (telegramPolling) {
           try {
             val updates = fetchTelegramUpdates()
+            if (updates.isNotEmpty()) {
+              backoffMs = 800L
+            }
             for (u in updates) {
               if (u.updateId > telegramLastUpdateId) {
                 telegramLastUpdateId = u.updateId
                 prefs.edit { putLong("telegramLastUpdateId", telegramLastUpdateId) }
               }
               if (u.text.isNotBlank()) {
-                lastInboundText = u.text
-                lastOutboundText = "[android-local] received: ${u.text}"
-                sendTelegramMessage(u.chatId, lastOutboundText)
+                handleIncomingTelegramMessage(u.chatId, u.text)
+                telegramHandledCount += 1
+                prefs.edit { putLong("telegramHandledCount", telegramHandledCount) }
               }
             }
           } catch (t: Throwable) {
             lastTelegramError = t.message ?: t.javaClass.simpleName
+            backoffMs = (backoffMs * 2).coerceAtMost(15000L)
           }
-          Thread.sleep(1500)
+          try {
+            Thread.sleep(backoffMs)
+          } catch (_: InterruptedException) {
+            break
+          }
         }
       }
   }
@@ -473,6 +495,23 @@ class GatewayLocalService : Service() {
     telegramPolling = false
     telegramPollThread?.interrupt()
     telegramPollThread = null
+  }
+
+  private fun handleIncomingTelegramMessage(chatId: String, text: String) {
+    lastInboundText = text
+    val trimmed = text.trim()
+    lastOutboundText =
+      when {
+        trimmed.equals("/start", ignoreCase = true) ->
+          "✅ OpenClaw local gateway is online on Android. Send /status to check health."
+        trimmed.equals("/status", ignoreCase = true) ->
+          "📡 Gateway: running=${isRunning.get()} | polling=$telegramPolling | updateId=$telegramLastUpdateId"
+        trimmed.equals("/help", ignoreCase = true) ->
+          "Commands: /start /status /help"
+        else ->
+          "[android-local] received: $trimmed"
+      }
+    sendTelegramMessage(chatId, lastOutboundText)
   }
 
   private data class TelegramUpdate(val updateId: Long, val chatId: String, val text: String)
