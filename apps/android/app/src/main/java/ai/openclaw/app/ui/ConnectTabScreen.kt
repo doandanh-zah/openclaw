@@ -149,6 +149,49 @@ fun ConnectTabScreen(viewModel: MainViewModel) {
       )
     }
 
+    // One-tap local gateway quick start (Android-local fork UX)
+    Surface(
+      modifier = Modifier.fillMaxWidth(),
+      shape = RoundedCornerShape(14.dp),
+      color = mobileCardSurface,
+      border = BorderStroke(1.dp, mobileAccent.copy(alpha = 0.35f)),
+    ) {
+      Column(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+      ) {
+        Text("Android Local Gateway", style = mobileHeadline, color = mobileText)
+        Text(
+          "No laptop/VPS needed. One tap to use local gateway on this phone (:18789).",
+          style = mobileCallout,
+          color = mobileTextSecondary,
+        )
+        Button(
+          onClick = {
+            inputMode = ConnectInputMode.Manual
+            manualHostInput = "127.0.0.1"
+            manualPortInput = "18789"
+            manualTlsInput = false
+            validationText = null
+            viewModel.setManualEnabled(true)
+            viewModel.setManualHost("127.0.0.1")
+            viewModel.setManualPort(18789)
+            viewModel.setManualTls(false)
+            viewModel.connectManual()
+          },
+          modifier = Modifier.fillMaxWidth().height(46.dp),
+          shape = RoundedCornerShape(12.dp),
+          colors =
+            ButtonDefaults.buttonColors(
+              containerColor = mobileAccent,
+              contentColor = Color.White,
+            ),
+        ) {
+          Text("Use Local Gateway Now", style = mobileCallout.copy(fontWeight = FontWeight.Bold))
+        }
+      }
+    }
+
     // Status cards in a unified card group
     Surface(
       modifier = Modifier.fillMaxWidth(),
