@@ -46,6 +46,7 @@ class GatewayLocalService : Service() {
   private var telegramLastUpdateId: Long = 0L
   private var telegramHandledCount: Long = 0L
   private val prefs by lazy { applicationContext.getSharedPreferences("openclaw.gateway.local", Context.MODE_PRIVATE) }
+  private val securePrefs by lazy { SecurePrefs(applicationContext) }
   private val json = Json { ignoreUnknownKeys = true }
   private var localToken: String = ""
   private var telegramBotToken: String = ""
@@ -59,16 +60,16 @@ class GatewayLocalService : Service() {
 
   override fun onCreate() {
     super.onCreate()
-    localToken = prefs.getString("localToken", null)?.takeIf { it.isNotBlank() }
+    localToken = securePrefs.getString("gateway.local.token")?.takeIf { it.isNotBlank() }
       ?: UUID.randomUUID().toString().replace("-", "")
-    telegramBotToken = prefs.getString("telegramBotToken", "") ?: ""
+    telegramBotToken = securePrefs.getString("gateway.local.telegram.botToken") ?: ""
     telegramChatId = prefs.getString("telegramChatId", "") ?: ""
-    oauthAccessToken = prefs.getString("oauthAccessToken", "") ?: ""
+    oauthAccessToken = securePrefs.getString("gateway.local.oauth.accessToken") ?: ""
     telegramLastUpdateId = prefs.getLong("telegramLastUpdateId", 0L)
     telegramHandledCount = prefs.getLong("telegramHandledCount", 0L)
     telegramPollingRequested = prefs.getBoolean("telegramPollingRequested", false)
 
-    prefs.edit { putString("localToken", localToken) }
+    securePrefs.putString("gateway.local.token", localToken)
     tokenRef.set(localToken)
     ensureChannel()
     startForeground(NOTIFICATION_ID, buildNotification("Starting local gateway…"))
@@ -217,7 +218,12 @@ class GatewayLocalService : Service() {
           sendJson(out, 200, payload)
         }
         path == "/token" && method == "GET" -> {
-          sendJson(out, 200, "{\"token\":\"$localToken\"}")
+          val remote = s.inetAddress
+          if (remote != null && !remote.isLoopbackAddress) {
+            sendJson(out, 401, "{\"error\":\"token_endpoint_local_only\"}")
+          } else {
+            sendJson(out, 200, "{\"token\":\"$localToken\"}")
+          }
         }
         path == "/v1/oauth/device/start" && method == "POST" -> {
           val clientId = jsonField(body, "clientId").ifBlank { "openclaw-android-local" }
@@ -233,7 +239,7 @@ class GatewayLocalService : Service() {
             sendJson(out, 400, "{\"ok\":false,\"error\":\"invalid_device_code\"}")
           } else {
             oauthAccessToken = UUID.randomUUID().toString().replace("-", "")
-            prefs.edit { putString("oauthAccessToken", oauthAccessToken) }
+            securePrefs.putString("gateway.local.oauth.accessToken", oauthAccessToken)
             sendJson(out, 200, "{\"ok\":true,\"accessToken\":\"$oauthAccessToken\",\"tokenType\":\"Bearer\"}")
           }
         }
@@ -269,10 +275,8 @@ class GatewayLocalService : Service() {
             } else {
               telegramBotToken = bot
               telegramChatId = chat
-              prefs.edit {
-                putString("telegramBotToken", telegramBotToken)
-                putString("telegramChatId", telegramChatId)
-              }
+              securePrefs.putString("gateway.local.telegram.botToken", telegramBotToken)
+              prefs.edit { putString("telegramChatId", telegramChatId) }
               sendJson(out, 200, "{\"ok\":true,\"configured\":true}")
             }
           }
@@ -296,10 +300,8 @@ class GatewayLocalService : Service() {
             } else {
               telegramBotToken = bot
               telegramChatId = chat
-              prefs.edit {
-                putString("telegramBotToken", telegramBotToken)
-                putString("telegramChatId", telegramChatId)
-              }
+              securePrefs.putString("gateway.local.telegram.botToken", telegramBotToken)
+              prefs.edit { putString("telegramChatId", telegramChatId) }
               telegramPollingRequested = true
               prefs.edit { putBoolean("telegramPollingRequested", true) }
               startTelegramPolling()
