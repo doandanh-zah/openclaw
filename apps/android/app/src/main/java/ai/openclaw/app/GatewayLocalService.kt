@@ -37,6 +37,9 @@ class GatewayLocalService : Service() {
   private var localToken: String = ""
   private var telegramBotToken: String = ""
   private var telegramChatId: String = ""
+  private var oauthDeviceCode: String = ""
+  private var oauthUserCode: String = ""
+  private var oauthAccessToken: String = ""
   private var lastInboundText: String = ""
   private var lastOutboundText: String = ""
   private var lastTelegramError: String = ""
@@ -132,11 +135,35 @@ class GatewayLocalService : Service() {
         path == "/health" -> sendJson(out, 200, "{\"ok\":true,\"service\":\"gateway-local\"}")
         path == "/status" -> {
           val payload =
-            "{\"ok\":true,\"port\":$PORT,\"running\":${isRunning.get()},\"mode\":\"scaffold\",\"tokenReady\":${localToken.isNotBlank()},\"telegramConfigured\":${telegramBotToken.isNotBlank() && telegramChatId.isNotBlank()}}"
+            "{\"ok\":true,\"port\":$PORT,\"running\":${isRunning.get()},\"mode\":\"scaffold\",\"tokenReady\":${localToken.isNotBlank()},\"telegramConfigured\":${telegramBotToken.isNotBlank() && telegramChatId.isNotBlank()},\"oauthReady\":${oauthAccessToken.isNotBlank()}}"
           sendJson(out, 200, payload)
         }
         path == "/token" && method == "GET" -> {
           sendJson(out, 200, "{\"token\":\"$localToken\"}")
+        }
+        path == "/v1/oauth/device/start" && method == "POST" -> {
+          val clientId = jsonField(body, "clientId").ifBlank { "openclaw-android-local" }
+          oauthDeviceCode = UUID.randomUUID().toString().replace("-", "")
+          oauthUserCode = oauthDeviceCode.take(6).uppercase()
+          val payload =
+            "{\"ok\":true,\"clientId\":\"${escapeJson(clientId)}\",\"deviceCode\":\"$oauthDeviceCode\",\"userCode\":\"$oauthUserCode\",\"verificationUri\":\"openclaw://local-oauth\"}"
+          sendJson(out, 200, payload)
+        }
+        path == "/v1/oauth/device/complete" && method == "POST" -> {
+          val deviceCode = jsonField(body, "deviceCode")
+          if (deviceCode.isBlank() || deviceCode != oauthDeviceCode) {
+            sendJson(out, 400, "{\"ok\":false,\"error\":\"invalid_device_code\"}")
+          } else {
+            oauthAccessToken = UUID.randomUUID().toString().replace("-", "")
+            sendJson(out, 200, "{\"ok\":true,\"accessToken\":\"$oauthAccessToken\",\"tokenType\":\"Bearer\"}")
+          }
+        }
+        path == "/v1/oauth/status" && method == "GET" -> {
+          if (!authorized(headers)) {
+            sendJson(out, 401, "{\"error\":\"unauthorized\"}")
+          } else {
+            sendJson(out, 200, "{\"ok\":true,\"ready\":${oauthAccessToken.isNotBlank()},\"userCode\":\"$oauthUserCode\"}")
+          }
         }
         path == "/v1/gateway/start" && method == "POST" -> {
           if (!authorized(headers)) {
