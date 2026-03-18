@@ -225,6 +225,26 @@ class GatewayLocalService : Service() {
             sendJson(out, 200, "{\"ok\":true,\"configured\":${telegramBotToken.isNotBlank() && telegramChatId.isNotBlank()},\"botToken\":\"$masked\",\"chatId\":\"${telegramChatId}\",\"lastError\":\"${escapeJson(lastTelegramError)}\"}")
           }
         }
+        path == "/v1/setup/quickstart" && method == "POST" -> {
+          if (!authorized(headers)) {
+            sendJson(out, 401, "{\"error\":\"unauthorized\"}")
+          } else {
+            val bot = jsonField(body, "botToken")
+            val chat = jsonField(body, "chatId")
+            if (bot.isBlank() || chat.isBlank()) {
+              sendJson(out, 400, "{\"error\":\"invalid_payload\",\"need\":[\"botToken\",\"chatId\"]}")
+            } else {
+              telegramBotToken = bot
+              telegramChatId = chat
+              prefs.edit {
+                putString("telegramBotToken", telegramBotToken)
+                putString("telegramChatId", telegramChatId)
+              }
+              startTelegramPolling()
+              sendJson(out, 200, "{\"ok\":true,\"configured\":true,\"polling\":true}")
+            }
+          }
+        }
         path == "/v1/telegram/poll/start" && method == "POST" -> {
           if (!authorized(headers)) {
             sendJson(out, 401, "{\"error\":\"unauthorized\"}")
