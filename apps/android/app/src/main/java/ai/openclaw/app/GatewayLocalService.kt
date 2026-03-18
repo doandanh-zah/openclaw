@@ -23,6 +23,10 @@ import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 
 /**
  * Android-local gateway scaffold (phase-2):
@@ -35,7 +39,11 @@ import kotlin.concurrent.thread
 class GatewayLocalService : Service() {
   private var serverThread: Thread? = null
   private var serverSocket: ServerSocket? = null
+  private var telegramPollThread: Thread? = null
+  @Volatile private var telegramPolling: Boolean = false
+  private var telegramLastUpdateId: Long = 0L
   private val prefs by lazy { applicationContext.getSharedPreferences("openclaw.gateway.local", Context.MODE_PRIVATE) }
+  private val json = Json { ignoreUnknownKeys = true }
   private var localToken: String = ""
   private var telegramBotToken: String = ""
   private var telegramChatId: String = ""
@@ -53,6 +61,7 @@ class GatewayLocalService : Service() {
     telegramBotToken = prefs.getString("telegramBotToken", "") ?: ""
     telegramChatId = prefs.getString("telegramChatId", "") ?: ""
     oauthAccessToken = prefs.getString("oauthAccessToken", "") ?: ""
+    telegramLastUpdateId = prefs.getLong("telegramLastUpdateId", 0L)
 
     prefs.edit { putString("localToken", localToken) }
     tokenRef.set(localToken)
@@ -72,6 +81,7 @@ class GatewayLocalService : Service() {
   }
 
   override fun onDestroy() {
+    stopTelegramPolling()
     stopServer()
     isRunning.set(false)
     tokenRef.set("")
@@ -213,6 +223,31 @@ class GatewayLocalService : Service() {
           } else {
             val masked = maskToken(telegramBotToken)
             sendJson(out, 200, "{\"ok\":true,\"configured\":${telegramBotToken.isNotBlank() && telegramChatId.isNotBlank()},\"botToken\":\"$masked\",\"chatId\":\"${telegramChatId}\",\"lastError\":\"${escapeJson(lastTelegramError)}\"}")
+          }
+        }
+        path == "/v1/telegram/poll/start" && method == "POST" -> {
+          if (!authorized(headers)) {
+            sendJson(out, 401, "{\"error\":\"unauthorized\"}")
+          } else if (telegramBotToken.isBlank()) {
+            sendJson(out, 400, "{\"error\":\"telegram_not_configured\"}")
+          } else {
+            startTelegramPolling()
+            sendJson(out, 200, "{\"ok\":true,\"polling\":true}")
+          }
+        }
+        path == "/v1/telegram/poll/stop" && method == "POST" -> {
+          if (!authorized(headers)) {
+            sendJson(out, 401, "{\"error\":\"unauthorized\"}")
+          } else {
+            stopTelegramPolling()
+            sendJson(out, 200, "{\"ok\":true,\"polling\":false}")
+          }
+        }
+        path == "/v1/telegram/poll/status" && method == "GET" -> {
+          if (!authorized(headers)) {
+            sendJson(out, 401, "{\"error\":\"unauthorized\"}")
+          } else {
+            sendJson(out, 200, "{\"ok\":true,\"polling\":$telegramPolling,\"lastUpdateId\":$telegramLastUpdateId}")
           }
         }
         path == "/v1/session" && method == "GET" -> {
@@ -385,6 +420,75 @@ class GatewayLocalService : Service() {
       lastTelegramError = t.message ?: t.javaClass.simpleName
       false
     }
+  }
+
+  private fun startTelegramPolling() {
+    if (telegramPolling) return
+    telegramPolling = true
+    telegramPollThread =
+      thread(start = true, name = "openclaw-telegram-poll") {
+        while (telegramPolling) {
+          try {
+            val updates = fetchTelegramUpdates()
+            for (u in updates) {
+              if (u.updateId > telegramLastUpdateId) {
+                telegramLastUpdateId = u.updateId
+                prefs.edit { putLong("telegramLastUpdateId", telegramLastUpdateId) }
+              }
+              if (u.text.isNotBlank()) {
+                lastInboundText = u.text
+                lastOutboundText = "[android-local] received: ${u.text}"
+                sendTelegramMessage(u.chatId, lastOutboundText)
+              }
+            }
+          } catch (t: Throwable) {
+            lastTelegramError = t.message ?: t.javaClass.simpleName
+          }
+          Thread.sleep(1500)
+        }
+      }
+  }
+
+  private fun stopTelegramPolling() {
+    telegramPolling = false
+    telegramPollThread?.interrupt()
+    telegramPollThread = null
+  }
+
+  private data class TelegramUpdate(val updateId: Long, val chatId: String, val text: String)
+
+  private fun fetchTelegramUpdates(): List<TelegramUpdate> {
+    if (telegramBotToken.isBlank()) return emptyList()
+    val endpoint =
+      "https://api.telegram.org/bot$telegramBotToken/getUpdates?timeout=10&offset=${telegramLastUpdateId + 1}"
+    val conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
+      requestMethod = "GET"
+      connectTimeout = 5000
+      readTimeout = 15000
+    }
+    val code = conn.responseCode
+    val body =
+      (if (code in 200..299) conn.inputStream else conn.errorStream)?.bufferedReader()?.use { it.readText() }
+        .orEmpty()
+    if (code !in 200..299 || !body.contains("\"ok\":true")) {
+      if (body.isNotBlank()) lastTelegramError = body
+      return emptyList()
+    }
+
+    val root = json.parseToJsonElement(body).jsonObject
+    val result = root["result"]?.jsonArray ?: return emptyList()
+    val out = mutableListOf<TelegramUpdate>()
+    result.forEach { item ->
+      val obj = item.jsonObject
+      val updateId = obj["update_id"]?.jsonPrimitive?.content?.toLongOrNull() ?: return@forEach
+      val msg = obj["message"]?.jsonObject ?: return@forEach
+      val text = msg["text"]?.jsonPrimitive?.content.orEmpty()
+      val chatId = msg["chat"]?.jsonObject?.get("id")?.jsonPrimitive?.content.orEmpty()
+      if (chatId.isNotBlank()) {
+        out += TelegramUpdate(updateId = updateId, chatId = chatId, text = text)
+      }
+    }
+    return out
   }
 
   private fun ensureChannel() {
