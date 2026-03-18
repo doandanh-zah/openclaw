@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import androidx.core.content.edit
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import java.io.BufferedReader
@@ -34,6 +35,7 @@ import kotlin.concurrent.thread
 class GatewayLocalService : Service() {
   private var serverThread: Thread? = null
   private var serverSocket: ServerSocket? = null
+  private val prefs by lazy { applicationContext.getSharedPreferences("openclaw.gateway.local", Context.MODE_PRIVATE) }
   private var localToken: String = ""
   private var telegramBotToken: String = ""
   private var telegramChatId: String = ""
@@ -46,7 +48,13 @@ class GatewayLocalService : Service() {
 
   override fun onCreate() {
     super.onCreate()
-    localToken = UUID.randomUUID().toString().replace("-", "")
+    localToken = prefs.getString("localToken", null)?.takeIf { it.isNotBlank() }
+      ?: UUID.randomUUID().toString().replace("-", "")
+    telegramBotToken = prefs.getString("telegramBotToken", "") ?: ""
+    telegramChatId = prefs.getString("telegramChatId", "") ?: ""
+    oauthAccessToken = prefs.getString("oauthAccessToken", "") ?: ""
+
+    prefs.edit { putString("localToken", localToken) }
     tokenRef.set(localToken)
     ensureChannel()
     startForeground(NOTIFICATION_ID, buildNotification("Starting local gateway…"))
@@ -155,6 +163,7 @@ class GatewayLocalService : Service() {
             sendJson(out, 400, "{\"ok\":false,\"error\":\"invalid_device_code\"}")
           } else {
             oauthAccessToken = UUID.randomUUID().toString().replace("-", "")
+            prefs.edit { putString("oauthAccessToken", oauthAccessToken) }
             sendJson(out, 200, "{\"ok\":true,\"accessToken\":\"$oauthAccessToken\",\"tokenType\":\"Bearer\"}")
           }
         }
@@ -190,6 +199,10 @@ class GatewayLocalService : Service() {
             } else {
               telegramBotToken = bot
               telegramChatId = chat
+              prefs.edit {
+                putString("telegramBotToken", telegramBotToken)
+                putString("telegramChatId", telegramChatId)
+              }
               sendJson(out, 200, "{\"ok\":true,\"configured\":true}")
             }
           }
@@ -296,7 +309,7 @@ class GatewayLocalService : Service() {
 
   private fun authorized(headers: Map<String, String>): Boolean {
     val auth = headers["authorization"].orEmpty()
-    return auth == "Bearer $localToken"
+    return auth == "Bearer $localToken" || (oauthAccessToken.isNotBlank() && auth == "Bearer $oauthAccessToken")
   }
 
   private fun sendText(out: BufferedWriter, status: Int, body: String) {
