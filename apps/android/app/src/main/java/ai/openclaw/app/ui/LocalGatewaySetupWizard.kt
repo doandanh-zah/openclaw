@@ -88,6 +88,7 @@ fun LocalGatewaySetupWizard(
   var gatewayBusy by remember { mutableStateOf(false) }
   var oauthBusy by remember { mutableStateOf(false) }
   var telegramBusy by remember { mutableStateOf(false) }
+  var telegramDiscoverBusy by remember { mutableStateOf(false) }
   var autoBusy by remember { mutableStateOf(false) }
 
   suspend fun refreshSnapshot() {
@@ -161,7 +162,19 @@ fun LocalGatewaySetupWizard(
     }
   }
 
+  suspend fun ensureGatewayReadyForSetup(): Boolean {
+    val ready = snapshot?.gateway?.running == true && snapshot?.gateway?.tokenReady == true
+    return if (ready) {
+      true
+    } else {
+      startGateway()
+    }
+  }
+
   suspend fun startOAuth(): Boolean {
+    if (!ensureGatewayReadyForSetup()) {
+      return false
+    }
     oauthBusy = true
     statusMessage = "Preparing ChatGPT login QR…"
     return try {
@@ -230,7 +243,10 @@ fun LocalGatewaySetupWizard(
     val botToken = botTokenInput.trim()
     val chatId = chatIdInput.trim()
     if (botToken.isBlank() || chatId.isBlank()) {
-      statusMessage = "Enter Telegram Bot Token and Chat ID first."
+      statusMessage = "Paste Bot Token, send /start to your bot, then discover or paste Chat ID."
+      return false
+    }
+    if (!ensureGatewayReadyForSetup()) {
       return false
     }
     telegramBusy = true
@@ -248,7 +264,36 @@ fun LocalGatewaySetupWizard(
     }
   }
 
+  suspend fun discoverTelegramChatId(): Boolean {
+    val botToken = botTokenInput.trim()
+    if (botToken.isBlank()) {
+      statusMessage = "Paste Telegram Bot Token first."
+      return false
+    }
+    telegramDiscoverBusy = true
+    statusMessage = "Checking Telegram updates. Send /start to your bot first if nothing shows up."
+    return try {
+      val result =
+        withContext(Dispatchers.IO) {
+          LocalGatewayClient.discoverTelegramChatId(botToken)
+        }
+      if (result.ok && !result.value.isNullOrBlank()) {
+        chatIdInput = result.value
+        statusMessage = "Found Telegram Chat ID ${result.value}."
+        true
+      } else {
+        statusMessage = result.message.ifBlank { "No Telegram chat found yet. Send /start to the bot and retry." }
+        false
+      }
+    } finally {
+      telegramDiscoverBusy = false
+    }
+  }
+
   suspend fun sendTelegramTest(): Boolean {
+    if (!ensureGatewayReadyForSetup()) {
+      return false
+    }
     telegramBusy = true
     statusMessage = "Sending Telegram test message…"
     return try {
@@ -265,6 +310,9 @@ fun LocalGatewaySetupWizard(
   }
 
   suspend fun startTelegramPolling() {
+    if (!ensureGatewayReadyForSetup()) {
+      return
+    }
     telegramBusy = true
     statusMessage = "Restarting Telegram polling…"
     try {
@@ -298,8 +346,12 @@ fun LocalGatewaySetupWizard(
         return
       }
 
-      if (botTokenInput.trim().isBlank() || chatIdInput.trim().isBlank()) {
-        statusMessage = "OAuth is ready. Enter Telegram Bot Token and Chat ID to finish setup."
+      if (botTokenInput.trim().isBlank()) {
+        statusMessage = "OAuth is ready. Paste Telegram Bot Token to continue."
+        return
+      }
+      if (chatIdInput.trim().isBlank() && !discoverTelegramChatId()) {
+        statusMessage = "OAuth is ready. Send /start to your bot, then retry Chat ID discovery."
         return
       }
 
@@ -361,7 +413,7 @@ fun LocalGatewaySetupWizard(
 
   val telegramState =
     when {
-      telegramBusy -> WizardStepState.Running
+      telegramBusy || telegramDiscoverBusy -> WizardStepState.Running
       telegram?.configured == true && telegram.lastTestOk -> WizardStepState.Done
       telegram?.lastError?.isNotBlank() == true -> WizardStepState.Error
       telegram?.configured == true || botTokenInput.isNotBlank() || chatIdInput.isNotBlank() -> WizardStepState.Running
@@ -669,7 +721,7 @@ fun LocalGatewaySetupWizard(
           telegram?.configured == true ->
             "Bot is configured. Send a test message to finish setup."
           else ->
-            "Save your Telegram bot token, start polling, then send one test message."
+            "Paste Bot Token, DM your bot with /start, discover Chat ID, then save and test."
         },
       error = telegram?.lastError?.takeIf { it.isNotBlank() },
       content = {
@@ -695,6 +747,11 @@ fun LocalGatewaySetupWizard(
           shape = RoundedCornerShape(14.dp),
           colors = wizardOutlinedColors(),
         )
+        Text(
+          "Order: 1) paste Bot Token  2) open Telegram and send /start to your bot  3) tap Discover Chat ID  4) Save & Start.",
+          style = mobileCaption1,
+          color = mobileTextSecondary,
+        )
         if (telegram != null) {
           if (telegram.botTokenMasked.isNotBlank()) {
             InfoLine(label = "Saved bot token", value = telegram.botTokenMasked, monospace = true)
@@ -713,10 +770,24 @@ fun LocalGatewaySetupWizard(
           Button(
             onClick = {
               scope.launch {
+                discoverTelegramChatId()
+              }
+            },
+            enabled = !telegramBusy && !telegramDiscoverBusy && botTokenInput.isNotBlank(),
+            shape = RoundedCornerShape(12.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = mobileSurface, contentColor = mobileText),
+            border = BorderStroke(1.dp, mobileBorder),
+            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
+          ) {
+            Text("Discover Chat ID", style = mobileCaption1.copy(fontWeight = FontWeight.Bold))
+          }
+          Button(
+            onClick = {
+              scope.launch {
                 quickstartTelegram()
               }
             },
-            enabled = !telegramBusy && !autoBusy,
+            enabled = !telegramBusy && !telegramDiscoverBusy && !autoBusy,
             shape = RoundedCornerShape(12.dp),
             colors = ButtonDefaults.buttonColors(containerColor = mobileAccent, contentColor = Color.White),
             contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
@@ -733,7 +804,7 @@ fun LocalGatewaySetupWizard(
                 sendTelegramTest()
               }
             },
-            enabled = !telegramBusy && !autoBusy,
+            enabled = !telegramBusy && !telegramDiscoverBusy && !autoBusy,
             shape = RoundedCornerShape(12.dp),
             colors = ButtonDefaults.buttonColors(containerColor = mobileSuccess, contentColor = Color.White),
             contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
@@ -746,7 +817,7 @@ fun LocalGatewaySetupWizard(
                 startTelegramPolling()
               }
             },
-            enabled = telegram?.configured == true && !telegramBusy,
+            enabled = telegram?.configured == true && !telegramBusy && !telegramDiscoverBusy,
             shape = RoundedCornerShape(12.dp),
             colors = ButtonDefaults.buttonColors(containerColor = mobileSurface, contentColor = mobileText),
             border = BorderStroke(1.dp, mobileBorder),

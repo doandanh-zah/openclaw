@@ -2,7 +2,9 @@ package ai.openclaw.app
 
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLEncoder
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
@@ -119,9 +121,12 @@ object LocalGatewayClient {
     body: String? = null,
     timeoutMs: Int = 5_000,
   ): HttpResult {
-    val token = getLocalToken()
+    val token = waitForLocalToken(timeoutMs = timeoutMs.coerceAtLeast(2_000))
     if (token.isBlank()) {
-      return HttpResult(code = 503, body = """{"error":"local_gateway_token_missing"}""")
+      return HttpResult(
+        code = 503,
+        body = """{"error":"local_gateway_token_missing","message":"Start Local Gateway first, then retry."}""",
+      )
     }
     return request(method = method, path = path, body = body, bearer = token, timeoutMs = timeoutMs)
   }
@@ -152,6 +157,18 @@ object LocalGatewayClient {
     } catch (_: Throwable) {
       ""
     }
+  }
+
+  private fun waitForLocalToken(timeoutMs: Int = 3_500, intervalMs: Long = 150L): String {
+    val deadline = System.currentTimeMillis() + timeoutMs
+    while (System.currentTimeMillis() < deadline) {
+      val token = getLocalToken()
+      if (token.isNotBlank()) {
+        return token
+      }
+      Thread.sleep(intervalMs)
+    }
+    return getLocalToken()
   }
 
   fun waitForGatewayReady(timeoutMs: Int = 8_000, intervalMs: Long = 350L): ApiResult<WizardSnapshot> {
@@ -273,6 +290,51 @@ object LocalGatewayClient {
     val payload = """{"botToken":"${escape(botToken)}","chatId":"${escape(chatId)}"}"""
     val result = requestAuthorized("POST", "/v1/setup/quickstart", payload)
     return simpleMessageResult(result, successMessage = "Telegram quick setup complete")
+  }
+
+  fun discoverTelegramChatId(botToken: String): ApiResult<String> {
+    if (botToken.isBlank()) return ApiResult(ok = false, message = "Bot token is required")
+    return try {
+      val endpoint =
+        "https://api.telegram.org/bot${botToken.trim()}/getUpdates?timeout=1&allowed_updates=" +
+          URLEncoder.encode("[\"message\"]", "UTF-8")
+      val conn =
+        (URL(endpoint).openConnection() as HttpURLConnection).apply {
+          requestMethod = "GET"
+          connectTimeout = 5000
+          readTimeout = 10000
+        }
+      val code = conn.responseCode
+      val body =
+        (if (code in 200..299) conn.inputStream else conn.errorStream)
+          ?.bufferedReader()
+          ?.use { it.readText() }
+          .orEmpty()
+      if (code !in 200..299) {
+        return ApiResult(ok = false, message = parseErrorMessage(body), statusCode = code)
+      }
+      val root = parseObject(body) ?: return ApiResult(ok = false, message = "Invalid Telegram response")
+      val resultArr = root["result"]?.jsonArray.orEmpty()
+      val chatIds =
+        resultArr
+          .mapNotNull { updateEl ->
+            val updateObj = updateEl.jsonObject
+            val msgObj = updateObj["message"]?.jsonObject ?: return@mapNotNull null
+            val chatObj = msgObj["chat"]?.jsonObject ?: return@mapNotNull null
+            chatObj["id"]?.let { idEl ->
+              (idEl as? JsonPrimitive)?.contentOrNull
+            }
+          }
+          .filter { it.isNotBlank() }
+      val picked = chatIds.lastOrNull()
+      if (picked.isNullOrBlank()) {
+        ApiResult(ok = false, message = "No chat found yet. Send /start to your bot then retry.")
+      } else {
+        ApiResult(ok = true, value = picked, message = "Chat id discovered")
+      }
+    } catch (t: Throwable) {
+      ApiResult(ok = false, message = t.message ?: t.javaClass.simpleName)
+    }
   }
 
   fun startTelegramPolling(): ApiResult<String> {
@@ -413,7 +475,10 @@ object LocalGatewayClient {
     if (directMessage.isNotBlank()) return directMessage
     val error = obj["error"]
     if (error is JsonPrimitive) {
-      return error.contentOrNull.orEmpty().ifBlank { body.ifBlank { "Request failed" } }
+      return when (val code = error.contentOrNull.orEmpty()) {
+        "local_gateway_token_missing" -> "Start Local Gateway first, then retry."
+        else -> code.ifBlank { body.ifBlank { "Request failed" } }
+      }
     }
     val errorObj = error as? JsonObject
     if (errorObj != null) {
