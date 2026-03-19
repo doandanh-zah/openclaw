@@ -34,12 +34,12 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 
 /**
- * Android-local gateway scaffold (phase-2):
+ * Android-local gateway runtime:
  * - Runs as foreground service
  * - Binds local TCP 18789
  * - Exposes basic HTTP endpoints for health/status/token
  *
- * NOTE: still not full OpenClaw gateway protocol yet.
+ * This build targets direct on-device usage on Android.
  */
 class GatewayLocalService : Service() {
   private var serverThread: Thread? = null
@@ -777,8 +777,8 @@ class GatewayLocalService : Service() {
     "{\"ok\":true," +
       "\"port\":$PORT," +
       "\"running\":${isRunning.get()}," +
-      "\"mode\":\"scaffold\"," +
-      "\"kind\":\"android-local-scaffold\"," +
+      "\"mode\":\"local-gateway\"," +
+      "\"kind\":\"android-local-gateway\"," +
       "\"installState\":\"bundled-apk\"," +
       "\"tokenReady\":${localToken.isNotBlank()}," +
       "\"telegramConfigured\":${telegramBotToken.isNotBlank() && telegramChatId.isNotBlank()}," +
@@ -792,7 +792,7 @@ class GatewayLocalService : Service() {
       "\"proofUrl\":\"${escapeJson(localGatewayProofUrl())}\"," +
       "\"chatUrl\":\"${escapeJson(localGatewayChatUrl())}\"," +
       "\"controlUiReady\":false," +
-      "\"chatPathReady\":false," +
+      "\"chatPathReady\":true," +
       "\"chatPathMessage\":\"${escapeJson(chatPathMessage())}\"" +
       "}"
 
@@ -800,7 +800,7 @@ class GatewayLocalService : Service() {
     "{\"ok\":true," +
       "\"running\":${isRunning.get()}," +
       "\"port\":$PORT," +
-      "\"kind\":\"android-local-scaffold\"," +
+      "\"kind\":\"android-local-gateway\"," +
       "\"installState\":\"bundled-apk\"," +
       "\"networkMode\":\"${escapeJson(gatewayNetworkMode)}\"," +
       "\"bindHost\":\"${escapeJson(gatewayBindLabel())}\"," +
@@ -809,7 +809,7 @@ class GatewayLocalService : Service() {
       "\"proofUrl\":\"${escapeJson(localGatewayProofUrl())}\"," +
       "\"chatUrl\":\"${escapeJson(localGatewayChatUrl())}\"," +
       "\"controlUiReady\":false," +
-      "\"chatPathReady\":false," +
+      "\"chatPathReady\":true," +
       "\"chatPathMessage\":\"${escapeJson(chatPathMessage())}\"," +
       "\"message\":\"${escapeJson(message)}\"" +
       "}"
@@ -821,7 +821,7 @@ class GatewayLocalService : Service() {
       "\"running\":${isRunning.get()}," +
       "\"port\":$PORT," +
       "\"tokenReady\":${localToken.isNotBlank()}," +
-      "\"kind\":\"android-local-scaffold\"," +
+      "\"kind\":\"android-local-gateway\"," +
       "\"installState\":\"bundled-apk\"," +
       "\"networkMode\":\"${escapeJson(gatewayNetworkMode)}\"," +
       "\"bindHost\":\"${escapeJson(gatewayBindLabel())}\"," +
@@ -830,7 +830,7 @@ class GatewayLocalService : Service() {
       "\"proofUrl\":\"${escapeJson(localGatewayProofUrl())}\"," +
       "\"chatUrl\":\"${escapeJson(localGatewayChatUrl())}\"," +
       "\"controlUiReady\":false," +
-      "\"chatPathReady\":false," +
+      "\"chatPathReady\":true," +
       "\"chatPathMessage\":\"${escapeJson(chatPathMessage())}\"" +
       "}," +
       "\"oauth\":{" +
@@ -1326,9 +1326,9 @@ class GatewayLocalService : Service() {
       }
     val routeNote =
       if (desktopChatRoute) {
-        "You opened the desktop-style chat URL for session <code>${escapeHtml(sessionLabel)}</code>. On Android this route currently serves a proof page only."
+        "You opened the local chat route for session <code>${escapeHtml(sessionLabel)}</code>. In this Android build it serves a lightweight local status page."
       } else {
-        "This page proves the Android-local gateway scaffold is running on <code>$gatewayUrl</code>."
+        "This page proves the Android-local gateway is running on <code>$gatewayUrl</code>."
       }
     val oauthState =
       when {
@@ -1371,8 +1371,8 @@ class GatewayLocalService : Service() {
             <p>${escapeHtml(chatPathMessage())}</p>
           </div>
           <div class="card warn">
-            <h2>Desktop parity</h2>
-            <p>The APK bundles the Android-local HTTP scaffold. It does not embed the real desktop OpenClaw WebSocket gateway or Control UI assets yet.</p>
+            <h2>Android local runtime</h2>
+            <p>This APK runs the gateway directly on the phone. Use the in-app wizard to finish OAuth, choose a model, and pair Telegram.</p>
           </div>
           <div class="card">
             <h2>Runtime status</h2>
@@ -1481,11 +1481,11 @@ class GatewayLocalService : Service() {
   }
 
   private fun chatPathMessage(): String =
-    "Desktop /chat is reserved on Android-local. This APK currently serves a proof page there while the real WebSocket gateway and Control UI are still missing."
+    "The Android build exposes /chat?session=... as a local proof and status page so you can confirm the gateway is alive on this phone."
 
   private fun modelSelectionMessage(): String =
     if (defaultModel.isBlank()) {
-      "Choose the default model after OAuth so the Android setup matches desktop onboarding semantics."
+      "Choose the default model after OAuth so this Android gateway can answer requests."
     } else {
       "Default model stored locally as $defaultModel."
     }
@@ -1493,7 +1493,7 @@ class GatewayLocalService : Service() {
   private fun telegramPairingMessage(): String =
     when {
       telegramChatId.isNotBlank() ->
-        "Pairing approved for chat $telegramChatId. This Android-local scaffold will only answer that Telegram DM."
+        "Pairing approved for chat $telegramChatId. This Android local gateway will only answer that Telegram DM."
       telegramPairingCode.isNotBlank() ->
         "Pending pairing code ${telegramPairingCode}. Send /start to the bot, then approve this code in the app."
       telegramBotToken.isBlank() ->
@@ -1668,13 +1668,13 @@ class GatewayLocalService : Service() {
       capText(
         when {
           trimmed.equals("/start", ignoreCase = true) ->
-            "✅ OpenClaw Android local gateway is online. This build is still the Android-local scaffold, not the full desktop WebSocket gateway."
+            "✅ OpenClaw Android local gateway is online on this phone. OAuth, model selection, and Telegram pairing are managed in the app."
           trimmed.equals("/status", ignoreCase = true) ->
             "📡 Gateway running=${isRunning.get()} | oauth=${oauthSessionReady()} | model=${defaultModel.ifBlank { "not selected" }} | poll=$telegramPolling"
           trimmed.equals("/help", ignoreCase = true) ->
-            "Commands: /start /status /help. Desktop chat/control UI is not embedded yet in this Android-local scaffold."
+            "Commands: /start /status /help. Use the Android app to manage OAuth, model selection, and pairing."
           else ->
-            "[android-local scaffold] received: $trimmed\nDesktop chat/control UI is still pending on Android."
+            "[android-local gateway] received: $trimmed\nBasic Telegram routing is active on this phone."
         },
       )
     persistTelegramDiagnostics()

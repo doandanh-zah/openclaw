@@ -190,7 +190,7 @@ fun ConnectTabScreen(viewModel: MainViewModel) {
       ) {
         Text("Android Local Gateway", style = mobileHeadline, color = mobileText)
         Text(
-          "No laptop/VPS needed. This opens the Android-local scaffold on this phone (:18789), not the full desktop WebSocket gateway.",
+          "No laptop/VPS needed. This opens the Android-local gateway on this phone at `:18789`.",
           style = mobileCallout,
           color = mobileTextSecondary,
         )

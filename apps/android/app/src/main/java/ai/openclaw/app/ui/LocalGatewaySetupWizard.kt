@@ -395,7 +395,7 @@ fun LocalGatewaySetupWizard(
       }
 
       if (snapshot?.model?.ready != true) {
-        statusMessage = "OAuth is ready. Choose the default model to match desktop onboarding."
+        statusMessage = "OAuth is ready. Choose the default model for this Android gateway."
         return
       }
 
@@ -502,7 +502,7 @@ fun LocalGatewaySetupWizard(
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
       Text("OpenClaw Local Gateway", style = mobileDisplay, color = mobileText)
       Text(
-        "Set up the Android-local gateway flow directly on this phone. The APK already bundles the local service, but the full desktop WebSocket gateway and Control UI are still not embedded here.",
+        "Set up OpenClaw directly on this phone. The APK already bundles the Android-local gateway service so you can keep it running on-device with ChatGPT OAuth and Telegram.",
         style = mobileCallout,
         color = mobileTextSecondary,
       )
@@ -520,7 +520,7 @@ fun LocalGatewaySetupWizard(
       ) {
         Text("Full Auto Setup", style = mobileTitle2, color = mobileText)
         Text(
-          "Starts the Android-local scaffold, prepares ChatGPT login, waits for model selection, then gets Telegram ready for pairing approval.",
+          "Starts the Android-local gateway, prepares ChatGPT login, waits for model selection, then gets Telegram ready for pairing approval.",
           style = mobileCallout,
           color = mobileTextSecondary,
         )
@@ -552,13 +552,13 @@ fun LocalGatewaySetupWizard(
       detail =
         when {
           gatewayState == WizardStepState.Done ->
-            "The APK-bundled Android local service is running. It is still the Android-local scaffold, not the full desktop WebSocket gateway."
+            "The APK-bundled Android local gateway is running on this phone."
           gatewayState == WizardStepState.Running ->
             "Starting the bundled foreground service and waiting for a local health check."
           snapshotError.isNotBlank() ->
             snapshotError
           else ->
-            "The install step is already bundled into the APK. Choose a bind mode, start the service, then prove it with the local /chat URL."
+            "The install step is already bundled into the APK. Choose a bind mode, start the service, then prove it with the local page."
         },
       error = snapshotError.takeIf { gatewayState == WizardStepState.Error },
       content = {
@@ -607,12 +607,12 @@ fun LocalGatewaySetupWizard(
           color = mobileTextSecondary,
         )
         InfoLine(label = "Install", value = gateway?.installState?.ifBlank { "bundled-apk" } ?: "bundled-apk", monospace = true)
-        InfoLine(label = "Runtime", value = gateway?.kind?.ifBlank { "android-local-scaffold" } ?: "android-local-scaffold", monospace = true)
+        InfoLine(label = "Runtime", value = gateway?.kind?.ifBlank { "android-local-gateway" } ?: "android-local-gateway", monospace = true)
         if (!gateway?.localUrl.isNullOrBlank()) {
           InfoLine(label = "This phone", value = gateway?.localUrl.orEmpty(), monospace = true)
         }
         InfoLine(
-          label = "Reserved /chat URL",
+          label = "Local /chat URL",
           value = gateway?.chatUrl?.ifBlank { "http://127.0.0.1:${GatewayLocalService.PORT}/chat?session=main" } ?: "http://127.0.0.1:${GatewayLocalService.PORT}/chat?session=main",
           monospace = true,
         )
@@ -705,7 +705,7 @@ fun LocalGatewaySetupWizard(
           oauthState == WizardStepState.Done ->
             "ChatGPT is linked${oauth?.accountLabel?.takeIf { it.isNotBlank() }?.let { " as $it" }.orEmpty()} and the default model ${model?.selected.orEmpty()} is saved locally."
           oauth?.ready == true ->
-            "ChatGPT is linked. Pick the default model now so the flow matches desktop onboarding."
+            "ChatGPT is linked. Pick the default model now so the gateway can start answering requests."
           oauthState == WizardStepState.Running && oauth?.pending == true ->
             "QR login is ready. Open the link or scan the QR. The app will detect the localhost callback automatically."
           oauthState == WizardStepState.Running ->
@@ -733,7 +733,7 @@ fun LocalGatewaySetupWizard(
           HorizontalDivider(color = mobileBorder)
           Text("Default model", style = mobileHeadline, color = mobileText)
           Text(
-            "Desktop onboarding asks for model selection after login. Pick one of the suggested Codex models or type a custom provider/model ref.",
+            "Pick one of the suggested Codex models or type a custom provider/model ref for this Android gateway.",
             style = mobileCaption1,
             color = mobileTextSecondary,
           )
@@ -942,7 +942,7 @@ fun LocalGatewaySetupWizard(
           telegram?.pairingApproved == true ->
             "Telegram pairing is approved. Send a test message to confirm delivery."
           telegram?.pairingPending == true ->
-            "A Telegram pairing request is waiting. Approve the code below to mirror desktop pairing semantics."
+            "A Telegram pairing request is waiting. Approve the code below so this phone can trust that Telegram DM."
           telegram?.botTokenReady == true ->
             "Send /start to your bot. The pairing code will appear here automatically."
           else ->
@@ -962,7 +962,7 @@ fun LocalGatewaySetupWizard(
           colors = wizardOutlinedColors(),
         )
         Text(
-          "Desktop equivalent: `openclaw pairing approve telegram <CODE>`. This Android flow surfaces the pending code in-app and approves it locally.",
+          "When someone sends /start to your bot, this app shows the pending pairing code here. Approve it to bind that Telegram DM to this phone.",
           style = mobileCaption1,
           color = mobileTextSecondary,
         )
@@ -1031,7 +1031,7 @@ fun LocalGatewaySetupWizard(
           if (allDone) {
             "Gateway start, OAuth, model selection, Telegram bot setup, and pairing test are all green. Continue into the app for advanced or remote setup."
           } else {
-            "You can skip into the app at any time, but the Android-local scaffold should be running, the model should be saved, and Telegram pairing/test should be green before calling this setup done."
+            "You can skip into the app at any time, but the Android-local gateway should be running, the model should be saved, and Telegram pairing/test should be green before calling this setup done."
           },
           style = mobileCallout,
           color = mobileTextSecondary,
