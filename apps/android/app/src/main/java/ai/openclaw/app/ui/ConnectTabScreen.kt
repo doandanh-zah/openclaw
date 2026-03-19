@@ -190,7 +190,7 @@ fun ConnectTabScreen(viewModel: MainViewModel) {
       ) {
         Text("Android Local Gateway", style = mobileHeadline, color = mobileText)
         Text(
-          "No laptop/VPS needed. One tap to use local gateway on this phone (:18789).",
+          "No laptop/VPS needed. This opens the Android-local scaffold on this phone (:18789), not the full desktop WebSocket gateway.",
           style = mobileCallout,
           color = mobileTextSecondary,
         )
@@ -233,7 +233,7 @@ fun ConnectTabScreen(viewModel: MainViewModel) {
         verticalArrangement = Arrangement.spacedBy(8.dp),
       ) {
         Text("Telegram Quick Setup", style = mobileHeadline, color = mobileText)
-        Text("Step 1: paste Bot Token and tap Discover Chat ID (after /start). Step 2: Setup & Start.", style = mobileCallout, color = mobileTextSecondary)
+        Text("Legacy quick path: paste Bot Token, then Discover Chat ID after /start. The first-run wizard now prefers token-first plus pairing approval.", style = mobileCallout, color = mobileTextSecondary)
 
         OutlinedTextField(
           value = tgBotTokenInput,

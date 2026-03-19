@@ -81,7 +81,9 @@ fun LocalGatewaySetupWizard(
   var statusMessage by rememberSaveable { mutableStateOf("Checking local gateway…") }
 
   var botTokenInput by rememberSaveable { mutableStateOf("") }
-  var chatIdInput by rememberSaveable { mutableStateOf("") }
+  var selectedModelInput by rememberSaveable { mutableStateOf("") }
+  var customModelInput by rememberSaveable { mutableStateOf("") }
+  var pairingCodeInput by rememberSaveable { mutableStateOf("") }
   var gatewayNetworkModeInput by rememberSaveable { mutableStateOf("") }
   var gatewayTokenValue by rememberSaveable { mutableStateOf("") }
 
@@ -111,8 +113,17 @@ fun LocalGatewaySetupWizard(
           gatewayTokenValue = token
         }
       }
-      if (chatIdInput.isBlank() && result.value.telegram.chatId.isNotBlank()) {
-        chatIdInput = result.value.telegram.chatId
+      if (result.value.telegram.pairingApproved) {
+        pairingCodeInput = ""
+      } else if (pairingCodeInput.isBlank() && result.value.telegram.pairingCode.isNotBlank()) {
+        pairingCodeInput = result.value.telegram.pairingCode
+      }
+      if (selectedModelInput.isBlank() && customModelInput.isBlank() && result.value.model.selected.isNotBlank()) {
+        if (result.value.model.selected in result.value.model.suggested) {
+          selectedModelInput = result.value.model.selected
+        } else {
+          customModelInput = result.value.model.selected
+        }
       }
     } else if (result.message.isNotBlank()) {
       snapshotError = result.message
@@ -239,54 +250,91 @@ fun LocalGatewaySetupWizard(
     }
   }
 
-  suspend fun quickstartTelegram(): Boolean {
+  suspend fun saveDefaultModel(): Boolean {
+    val chosenModel =
+      customModelInput.trim().ifBlank {
+        selectedModelInput.trim()
+      }
+    if (chosenModel.isBlank()) {
+      statusMessage = "Choose a suggested model or type a custom provider/model value."
+      return false
+    }
+    if (!ensureGatewayReadyForSetup()) {
+      return false
+    }
+    oauthBusy = true
+    statusMessage = "Saving default model…"
+    return try {
+      val result =
+        withContext(Dispatchers.IO) {
+          LocalGatewayClient.setDefaultModel(chosenModel)
+        }
+      refreshSnapshot()
+      statusMessage = result.message.ifBlank { if (result.ok) "Default model saved." else "Model save failed." }
+      result.ok
+    } finally {
+      oauthBusy = false
+    }
+  }
+
+  suspend fun saveTelegramBotAndStart(): Boolean {
     val botToken = botTokenInput.trim()
-    val chatId = chatIdInput.trim()
-    if (botToken.isBlank() || chatId.isBlank()) {
-      statusMessage = "Paste Bot Token, send /start to your bot, then discover or paste Chat ID."
+    if (botToken.isBlank()) {
+      statusMessage = "Paste Telegram Bot Token first."
       return false
     }
     if (!ensureGatewayReadyForSetup()) {
       return false
     }
     telegramBusy = true
-    statusMessage = "Saving Telegram bot settings and starting polling…"
+    statusMessage = "Saving Telegram bot token and starting polling…"
     return try {
       val result =
         withContext(Dispatchers.IO) {
-          LocalGatewayClient.quickstartTelegram(botToken = botToken, chatId = chatId)
+          LocalGatewayClient.saveTelegramBotToken(botToken = botToken, startPolling = true)
         }
       refreshSnapshot()
-      statusMessage = result.message.ifBlank { if (result.ok) "Telegram configured." else "Telegram setup failed." }
+      statusMessage =
+        result.message.ifBlank {
+          if (result.ok) {
+            "Telegram bot is live. Send /start to your bot, then approve the pairing code in this app."
+          } else {
+            "Telegram bot setup failed."
+          }
+        }
       result.ok
     } finally {
       telegramBusy = false
     }
   }
 
-  suspend fun discoverTelegramChatId(): Boolean {
-    val botToken = botTokenInput.trim()
-    if (botToken.isBlank()) {
-      statusMessage = "Paste Telegram Bot Token first."
+  suspend fun approveTelegramPairing(): Boolean {
+    val code =
+      pairingCodeInput.trim().ifBlank {
+        snapshot?.telegram?.pairingCode.orEmpty()
+      }
+    if (code.isBlank()) {
+      statusMessage = "No pending pairing code yet. Save the bot token, send /start to the bot, then wait for the code to appear."
       return false
     }
-    telegramDiscoverBusy = true
-    statusMessage = "Checking Telegram updates. Send /start to your bot first if nothing shows up."
+    if (!ensureGatewayReadyForSetup()) {
+      return false
+    }
+    telegramBusy = true
+    statusMessage = "Approving Telegram pairing…"
     return try {
       val result =
         withContext(Dispatchers.IO) {
-          LocalGatewayClient.discoverTelegramChatId(botToken)
+          LocalGatewayClient.approveTelegramPairing(code)
         }
-      if (result.ok && !result.value.isNullOrBlank()) {
-        chatIdInput = result.value
-        statusMessage = "Found Telegram Chat ID ${result.value}."
-        true
-      } else {
-        statusMessage = result.message.ifBlank { "No Telegram chat found yet. Send /start to the bot and retry." }
-        false
-      }
+      refreshSnapshot()
+      statusMessage =
+        result.message.ifBlank {
+          if (result.ok) "Telegram pairing approved." else "Telegram pairing approval failed."
+        }
+      result.ok
     } finally {
-      telegramDiscoverBusy = false
+      telegramBusy = false
     }
   }
 
@@ -346,25 +394,25 @@ fun LocalGatewaySetupWizard(
         return
       }
 
-      if (botTokenInput.trim().isBlank()) {
-        statusMessage = "OAuth is ready. Paste Telegram Bot Token to continue."
-        return
-      }
-      if (chatIdInput.trim().isBlank() && !discoverTelegramChatId()) {
-        statusMessage = "OAuth is ready. Send /start to your bot, then retry Chat ID discovery."
+      if (snapshot?.model?.ready != true) {
+        statusMessage = "OAuth is ready. Choose the default model to match desktop onboarding."
         return
       }
 
-      val telegramReady =
-        if (snapshot?.telegram?.configured == true) {
-          true
-        } else {
-          quickstartTelegram()
-        }
-      if (!telegramReady) return
+      if (botTokenInput.trim().isBlank() && snapshot?.telegram?.botTokenReady != true) {
+        statusMessage = "Model is saved. Paste Telegram Bot Token to continue."
+        return
+      }
 
-      if (snapshot?.telegram?.polling != true) {
-        startTelegramPolling()
+      if (snapshot?.telegram?.botTokenReady != true) {
+        val botReady = saveTelegramBotAndStart()
+        if (!botReady) return
+      }
+
+      if (snapshot?.telegram?.pairingApproved != true) {
+        statusMessage =
+          "Telegram bot is waiting. Send /start to your bot, then approve the pairing code here."
+        return
       }
 
       if (snapshot?.telegram?.lastTestOk != true) {
@@ -388,7 +436,10 @@ fun LocalGatewaySetupWizard(
 
   val gateway = snapshot?.gateway
   val oauth = snapshot?.oauth
+  val model = snapshot?.model
   val telegram = snapshot?.telegram
+  val suggestedModels =
+    model?.suggested?.takeIf { it.isNotEmpty() } ?: GatewayLocalService.DEFAULT_MODEL_CHOICES
   val effectiveGatewayNetworkMode =
     gatewayNetworkModeInput.ifBlank {
       gateway?.networkMode ?: GatewayLocalService.NETWORK_MODE_LOCAL
@@ -397,7 +448,7 @@ fun LocalGatewaySetupWizard(
   val gatewayState =
     when {
       gatewayBusy -> WizardStepState.Running
-      gateway?.running == true && gateway.tokenReady -> WizardStepState.Done
+      gateway?.running == true && gateway?.tokenReady == true -> WizardStepState.Done
       snapshotError.isNotBlank() && snapshot == null -> WizardStepState.Error
       else -> WizardStepState.Pending
     }
@@ -405,22 +456,38 @@ fun LocalGatewaySetupWizard(
   val oauthState =
     when {
       oauthBusy -> WizardStepState.Running
-      oauth?.ready == true -> WizardStepState.Done
       oauth?.lastError?.isNotBlank() == true -> WizardStepState.Error
       oauth?.pending == true -> WizardStepState.Running
+      oauth?.ready == true && model?.ready == true -> WizardStepState.Done
+      oauth?.ready == true -> WizardStepState.Running
       else -> WizardStepState.Pending
     }
 
-  val telegramState =
+  val telegramBotState =
     when {
       telegramBusy || telegramDiscoverBusy -> WizardStepState.Running
-      telegram?.configured == true && telegram.lastTestOk -> WizardStepState.Done
-      telegram?.lastError?.isNotBlank() == true -> WizardStepState.Error
-      telegram?.configured == true || botTokenInput.isNotBlank() || chatIdInput.isNotBlank() -> WizardStepState.Running
+      telegram?.botTokenReady == true && telegram?.requested == true -> WizardStepState.Done
+      telegram?.lastError?.isNotBlank() == true && telegram?.botTokenReady != true -> WizardStepState.Error
+      telegram?.botTokenReady == true || botTokenInput.isNotBlank() -> WizardStepState.Running
       else -> WizardStepState.Pending
     }
 
-  val allDone = gatewayState == WizardStepState.Done && oauthState == WizardStepState.Done && telegramState == WizardStepState.Done
+  val telegramPairingState =
+    when {
+      telegramBusy || telegramDiscoverBusy -> WizardStepState.Running
+      telegram?.pairingApproved == true && telegram?.lastTestOk == true -> WizardStepState.Done
+      telegram?.lastError?.isNotBlank() == true && (telegram?.pairingPending == true || telegram?.botTokenReady == true) ->
+        WizardStepState.Error
+      telegram?.pairingApproved == true || telegram?.pairingPending == true || telegram?.botTokenReady == true ->
+        WizardStepState.Running
+      else -> WizardStepState.Pending
+    }
+
+  val allDone =
+    gatewayState == WizardStepState.Done &&
+      oauthState == WizardStepState.Done &&
+      telegramBotState == WizardStepState.Done &&
+      telegramPairingState == WizardStepState.Done
   val qrContent = oauth?.verificationUriComplete?.ifBlank { oauth?.verificationUri.orEmpty() }.orEmpty()
 
   Column(
@@ -435,7 +502,7 @@ fun LocalGatewaySetupWizard(
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
       Text("OpenClaw Local Gateway", style = mobileDisplay, color = mobileText)
       Text(
-        "Set up the Android-local gateway directly on this phone. No laptop or VPS required.",
+        "Set up the Android-local gateway flow directly on this phone. The APK already bundles the local service, but the full desktop WebSocket gateway and Control UI are still not embedded here.",
         style = mobileCallout,
         color = mobileTextSecondary,
       )
@@ -453,7 +520,7 @@ fun LocalGatewaySetupWizard(
       ) {
         Text("Full Auto Setup", style = mobileTitle2, color = mobileText)
         Text(
-          "Starts the local gateway, prepares ChatGPT login, then finishes Telegram when your bot details are filled in.",
+          "Starts the Android-local scaffold, prepares ChatGPT login, waits for model selection, then gets Telegram ready for pairing approval.",
           style = mobileCallout,
           color = mobileTextSecondary,
         )
@@ -480,24 +547,18 @@ fun LocalGatewaySetupWizard(
 
     SetupStepCard(
       step = 1,
-      title = "Start Local Gateway",
+      title = "Install & Start Gateway",
       state = gatewayState,
       detail =
         when {
           gatewayState == WizardStepState.Done ->
-            if (gateway?.networkMode == GatewayLocalService.NETWORK_MODE_LAN) {
-              gateway.lanUrl.ifBlank {
-                "Foreground service is listening on 0.0.0.0:${gateway.port}. Devices on the same Wi-Fi can connect with the local gateway token."
-              }
-            } else {
-              "Foreground service is running on 127.0.0.1:${gateway?.port ?: GatewayLocalService.PORT}. Local auth token is ready."
-            }
+            "The APK-bundled Android local service is running. It is still the Android-local scaffold, not the full desktop WebSocket gateway."
           gatewayState == WizardStepState.Running ->
-            "Booting the foreground service and waiting for a health check."
+            "Starting the bundled foreground service and waiting for a local health check."
           snapshotError.isNotBlank() ->
             snapshotError
           else ->
-            "Choose whether the gateway stays on this phone only or is reachable on the same Wi-Fi."
+            "The install step is already bundled into the APK. Choose a bind mode, start the service, then prove it with the local /chat URL."
         },
       error = snapshotError.takeIf { gatewayState == WizardStepState.Error },
       content = {
@@ -545,14 +606,24 @@ fun LocalGatewaySetupWizard(
           style = mobileCaption1,
           color = mobileTextSecondary,
         )
+        InfoLine(label = "Install", value = gateway?.installState?.ifBlank { "bundled-apk" } ?: "bundled-apk", monospace = true)
+        InfoLine(label = "Runtime", value = gateway?.kind?.ifBlank { "android-local-scaffold" } ?: "android-local-scaffold", monospace = true)
         if (!gateway?.localUrl.isNullOrBlank()) {
           InfoLine(label = "This phone", value = gateway?.localUrl.orEmpty(), monospace = true)
+        }
+        InfoLine(
+          label = "Reserved /chat URL",
+          value = gateway?.chatUrl?.ifBlank { "http://127.0.0.1:${GatewayLocalService.PORT}/chat?session=main" } ?: "http://127.0.0.1:${GatewayLocalService.PORT}/chat?session=main",
+          monospace = true,
+        )
+        if (gateway?.chatPathMessage?.isNotBlank() == true) {
+          Text(gateway?.chatPathMessage.orEmpty(), style = mobileCaption1, color = mobileTextSecondary)
         }
         if (gateway?.networkMode == GatewayLocalService.NETWORK_MODE_LAN) {
           InfoLine(
             label = "LAN URL",
-            value = gateway.lanUrl.ifBlank { "Connect to this phone on the same Wi-Fi after start." },
-            monospace = gateway.lanUrl.isNotBlank(),
+            value = gateway?.lanUrl?.ifBlank { "Connect to this phone on the same Wi-Fi after start." }.orEmpty(),
+            monospace = gateway?.lanUrl?.isNotBlank() == true,
           )
           if (gatewayTokenValue.isNotBlank()) {
             InfoLine(
@@ -582,9 +653,27 @@ fun LocalGatewaySetupWizard(
             colors = ButtonDefaults.buttonColors(containerColor = mobileAccent, contentColor = Color.White),
           ) {
             Text(
-              if (gatewayState == WizardStepState.Done) "Apply Mode" else "Start Gateway",
+              if (gatewayState == WizardStepState.Done) "Apply Mode" else "Start",
               style = mobileCaption1.copy(fontWeight = FontWeight.Bold),
             )
+          }
+          Button(
+            onClick = {
+              val target =
+                gateway?.chatUrl?.ifBlank { "http://127.0.0.1:${GatewayLocalService.PORT}/chat?session=main" }
+                  ?: "http://127.0.0.1:${GatewayLocalService.PORT}/chat?session=main"
+              runCatching {
+                context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(target)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+              }.onFailure {
+                statusMessage = "Could not open the local /chat URL on this device."
+              }
+            },
+            enabled = gatewayState == WizardStepState.Done,
+            shape = RoundedCornerShape(12.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = mobileSurface, contentColor = mobileText),
+            border = BorderStroke(1.dp, mobileBorder),
+          ) {
+            Text("Open /chat", style = mobileCaption1.copy(fontWeight = FontWeight.Bold))
           }
           Button(
             onClick = {
@@ -601,7 +690,7 @@ fun LocalGatewaySetupWizard(
             colors = ButtonDefaults.buttonColors(containerColor = mobileSurface, contentColor = mobileText),
             border = BorderStroke(1.dp, mobileBorder),
           ) {
-            Text("Copy Token", style = mobileCaption1.copy(fontWeight = FontWeight.Bold))
+            Text("Token", style = mobileCaption1.copy(fontWeight = FontWeight.Bold))
           }
         }
       },
@@ -609,22 +698,24 @@ fun LocalGatewaySetupWizard(
 
     SetupStepCard(
       step = 2,
-      title = "Connect ChatGPT OAuth",
+      title = "ChatGPT OAuth + Model",
       state = oauthState,
       detail =
         when {
           oauthState == WizardStepState.Done ->
-            "ChatGPT session is linked${oauth?.accountLabel?.takeIf { it.isNotBlank() }?.let { " as $it" }.orEmpty()}. Refresh token is stored locally."
+            "ChatGPT is linked${oauth?.accountLabel?.takeIf { it.isNotBlank() }?.let { " as $it" }.orEmpty()} and the default model ${model?.selected.orEmpty()} is saved locally."
+          oauth?.ready == true ->
+            "ChatGPT is linked. Pick the default model now so the flow matches desktop onboarding."
           oauthState == WizardStepState.Running && oauth?.pending == true ->
             "QR login is ready. Open the link or scan the QR. The app will detect the localhost callback automatically."
           oauthState == WizardStepState.Running ->
             "Preparing the QR login flow."
           else ->
-            "Create a ChatGPT QR login flow for the local gateway and persist the session locally on this phone."
+            "Create a ChatGPT QR login flow for the Android-local gateway, then choose the default model after login."
         },
       error = oauth?.lastError?.takeIf { it.isNotBlank() },
       content = {
-        if (qrContent.isNotBlank() && oauthState != WizardStepState.Done) {
+        if (qrContent.isNotBlank() && oauth?.ready != true) {
           QrCodePanel(content = qrContent)
           Text(
             "After the browser signs in, it returns to localhost automatically. Come back to the app if the browser stays on the success page.",
@@ -632,14 +723,68 @@ fun LocalGatewaySetupWizard(
             color = mobileTextSecondary,
           )
           if (oauth?.userCode?.isNullOrBlank() == false) {
-            InfoLine(label = "User code", value = oauth.userCode, monospace = true)
+            InfoLine(label = "User code", value = oauth?.userCode.orEmpty(), monospace = true)
           }
           if (oauth?.verificationUriComplete?.isNullOrBlank() == false) {
-            InfoLine(
-              label = "Login link",
-              value = oauth.verificationUriComplete,
-              monospace = true,
-            )
+            InfoLine(label = "Login link", value = oauth?.verificationUriComplete.orEmpty(), monospace = true)
+          }
+        }
+        if (oauth?.ready == true) {
+          HorizontalDivider(color = mobileBorder)
+          Text("Default model", style = mobileHeadline, color = mobileText)
+          Text(
+            "Desktop onboarding asks for model selection after login. Pick one of the suggested Codex models or type a custom provider/model ref.",
+            style = mobileCaption1,
+            color = mobileTextSecondary,
+          )
+          suggestedModels.chunked(2).forEach { chunk ->
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+              chunk.forEach { candidate ->
+                val selected = selectedModelInput == candidate && customModelInput.isBlank()
+                if (selected) {
+                  Button(
+                    onClick = { selectedModelInput = candidate; customModelInput = "" },
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = mobileAccent, contentColor = Color.White),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+                  ) {
+                    Text(candidate.substringAfter('/'), style = mobileCaption1.copy(fontWeight = FontWeight.Bold))
+                  }
+                } else {
+                  OutlinedButton(
+                    onClick = { selectedModelInput = candidate; customModelInput = "" },
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = mobileText),
+                    border = BorderStroke(1.dp, mobileBorder),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+                  ) {
+                    Text(candidate.substringAfter('/'), style = mobileCaption1.copy(fontWeight = FontWeight.Bold))
+                  }
+                }
+              }
+            }
+          }
+          OutlinedTextField(
+            value = customModelInput,
+            onValueChange = {
+              customModelInput = it
+              if (it.isNotBlank()) {
+                selectedModelInput = ""
+              }
+            },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            placeholder = { Text("Custom provider/model", style = mobileBody, color = mobileTextTertiary) },
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
+            textStyle = mobileBody.copy(color = mobileText),
+            shape = RoundedCornerShape(14.dp),
+            colors = wizardOutlinedColors(),
+          )
+          if (model?.selected?.isNotBlank() == true) {
+            InfoLine(label = "Saved model", value = model?.selected.orEmpty(), monospace = true)
+          }
+          if (model?.message?.isNotBlank() == true) {
+            Text(model?.message.orEmpty(), style = mobileCaption1, color = mobileTextSecondary)
           }
         }
       },
@@ -684,15 +829,19 @@ fun LocalGatewaySetupWizard(
           Button(
             onClick = {
               scope.launch {
-                checkOAuthStatus()
+                if (oauth?.ready == true) {
+                  saveDefaultModel()
+                } else {
+                  checkOAuthStatus()
+                }
               }
             },
-            enabled = oauth?.pending == true && !oauthBusy,
+            enabled = (oauth?.pending == true || oauth?.ready == true) && !oauthBusy,
             shape = RoundedCornerShape(12.dp),
             colors = ButtonDefaults.buttonColors(containerColor = mobileSuccess, contentColor = Color.White),
             contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
           ) {
-            Text("Check Status", style = mobileCaption1.copy(fontWeight = FontWeight.Bold))
+            Text(if (oauth?.ready == true) "Save Model" else "Check Status", style = mobileCaption1.copy(fontWeight = FontWeight.Bold))
           }
         }
         TextButton(
@@ -711,19 +860,17 @@ fun LocalGatewaySetupWizard(
     SetupStepCard(
       step = 3,
       title = "Set Up Telegram Bot",
-      state = telegramState,
+      state = telegramBotState,
       detail =
         when {
-          telegramState == WizardStepState.Done ->
-            "Telegram polling is live and the last test message reached chat ${telegram?.chatId.orEmpty()}."
-          telegram?.configured == true && telegram.lastTestOk ->
-            "Telegram is configured and healthy."
-          telegram?.configured == true ->
-            "Bot is configured. Send a test message to finish setup."
+          telegramBotState == WizardStepState.Done ->
+            "Telegram bot token is saved and polling is running. Pairing approval is the next step."
+          telegram?.botTokenReady == true ->
+            "Telegram bot token is saved. Send /start to your bot so the app can create a pairing code."
           else ->
-            "Paste Bot Token, DM your bot with /start, discover Chat ID, then save and test."
+            "Paste the Bot Token only. Do not ask the user for Chat ID up front."
         },
-      error = telegram?.lastError?.takeIf { it.isNotBlank() },
+      error = telegram?.lastError?.takeIf { it.isNotBlank() && telegram?.botTokenReady != true },
       content = {
         OutlinedTextField(
           value = botTokenInput,
@@ -736,32 +883,18 @@ fun LocalGatewaySetupWizard(
           shape = RoundedCornerShape(14.dp),
           colors = wizardOutlinedColors(),
         )
-        OutlinedTextField(
-          value = chatIdInput,
-          onValueChange = { chatIdInput = it },
-          modifier = Modifier.fillMaxWidth(),
-          singleLine = true,
-          placeholder = { Text("Chat ID", style = mobileBody, color = mobileTextTertiary) },
-          keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
-          textStyle = mobileBody.copy(color = mobileText),
-          shape = RoundedCornerShape(14.dp),
-          colors = wizardOutlinedColors(),
-        )
         Text(
-          "Order: 1) paste Bot Token  2) open Telegram and send /start to your bot  3) tap Discover Chat ID  4) Save & Start.",
+          "Order: 1) paste Bot Token  2) tap Save Bot  3) open Telegram and send /start to your bot  4) approve the pairing code in Step 4.",
           style = mobileCaption1,
           color = mobileTextSecondary,
         )
         if (telegram != null) {
-          if (telegram.botTokenMasked.isNotBlank()) {
-            InfoLine(label = "Saved bot token", value = telegram.botTokenMasked, monospace = true)
+          if (telegram?.botTokenMasked?.isNotBlank() == true) {
+            InfoLine(label = "Saved bot token", value = telegram?.botTokenMasked.orEmpty(), monospace = true)
           }
-          if (telegram.chatId.isNotBlank()) {
-            InfoLine(label = "Saved chat ID", value = telegram.chatId, monospace = true)
-          }
-          InfoLine(label = "Polling", value = if (telegram.polling) "Running" else "Stopped")
-          if (telegram.lastTestMessage.isNotBlank()) {
-            InfoLine(label = "Last test", value = telegram.lastTestMessage)
+          InfoLine(label = "Polling", value = if (telegram?.polling == true) "Running" else "Stopped")
+          if (telegram?.pairingMessage?.isNotBlank() == true) {
+            Text(telegram?.pairingMessage.orEmpty(), style = mobileCaption1, color = mobileTextSecondary)
           }
         }
       },
@@ -770,21 +903,7 @@ fun LocalGatewaySetupWizard(
           Button(
             onClick = {
               scope.launch {
-                discoverTelegramChatId()
-              }
-            },
-            enabled = !telegramBusy && !telegramDiscoverBusy && botTokenInput.isNotBlank(),
-            shape = RoundedCornerShape(12.dp),
-            colors = ButtonDefaults.buttonColors(containerColor = mobileSurface, contentColor = mobileText),
-            border = BorderStroke(1.dp, mobileBorder),
-            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
-          ) {
-            Text("Discover Chat ID", style = mobileCaption1.copy(fontWeight = FontWeight.Bold))
-          }
-          Button(
-            onClick = {
-              scope.launch {
-                quickstartTelegram()
+                saveTelegramBotAndStart()
               }
             },
             enabled = !telegramBusy && !telegramDiscoverBusy && !autoBusy,
@@ -792,24 +911,7 @@ fun LocalGatewaySetupWizard(
             colors = ButtonDefaults.buttonColors(containerColor = mobileAccent, contentColor = Color.White),
             contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
           ) {
-            Text("Save & Start", style = mobileCaption1.copy(fontWeight = FontWeight.Bold))
-          }
-          Button(
-            onClick = {
-              scope.launch {
-                if (telegram?.configured != true) {
-                  val configured = quickstartTelegram()
-                  if (!configured) return@launch
-                }
-                sendTelegramTest()
-              }
-            },
-            enabled = !telegramBusy && !telegramDiscoverBusy && !autoBusy,
-            shape = RoundedCornerShape(12.dp),
-            colors = ButtonDefaults.buttonColors(containerColor = mobileSuccess, contentColor = Color.White),
-            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
-          ) {
-            Text("Send Test", style = mobileCaption1.copy(fontWeight = FontWeight.Bold))
+            Text(if (telegram?.botTokenReady == true) "Update Bot" else "Save Bot", style = mobileCaption1.copy(fontWeight = FontWeight.Bold))
           }
           Button(
             onClick = {
@@ -817,13 +919,98 @@ fun LocalGatewaySetupWizard(
                 startTelegramPolling()
               }
             },
-            enabled = telegram?.configured == true && !telegramBusy && !telegramDiscoverBusy,
+            enabled = telegram?.botTokenReady == true && !telegramBusy && !telegramDiscoverBusy,
             shape = RoundedCornerShape(12.dp),
             colors = ButtonDefaults.buttonColors(containerColor = mobileSurface, contentColor = mobileText),
             border = BorderStroke(1.dp, mobileBorder),
             contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
           ) {
             Text("Restart Poll", style = mobileCaption1.copy(fontWeight = FontWeight.Bold))
+          }
+        }
+      },
+    )
+
+    SetupStepCard(
+      step = 4,
+      title = "Approve Telegram Pairing",
+      state = telegramPairingState,
+      detail =
+        when {
+          telegramPairingState == WizardStepState.Done ->
+            "Telegram pairing is approved for chat ${telegram?.chatId.orEmpty()} and the last test message succeeded."
+          telegram?.pairingApproved == true ->
+            "Telegram pairing is approved. Send a test message to confirm delivery."
+          telegram?.pairingPending == true ->
+            "A Telegram pairing request is waiting. Approve the code below to mirror desktop pairing semantics."
+          telegram?.botTokenReady == true ->
+            "Send /start to your bot. The pairing code will appear here automatically."
+          else ->
+            "Start the Telegram bot first so the user can request pairing."
+        },
+      error = telegram?.lastError?.takeIf { it.isNotBlank() && telegram?.botTokenReady == true },
+      content = {
+        OutlinedTextField(
+          value = pairingCodeInput,
+          onValueChange = { pairingCodeInput = it.uppercase() },
+          modifier = Modifier.fillMaxWidth(),
+          singleLine = true,
+          placeholder = { Text("Pairing code", style = mobileBody, color = mobileTextTertiary) },
+          keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
+          textStyle = mobileBody.copy(color = mobileText),
+          shape = RoundedCornerShape(14.dp),
+          colors = wizardOutlinedColors(),
+        )
+        Text(
+          "Desktop equivalent: `openclaw pairing approve telegram <CODE>`. This Android flow surfaces the pending code in-app and approves it locally.",
+          style = mobileCaption1,
+          color = mobileTextSecondary,
+        )
+        if (telegram != null) {
+          if (telegram?.pairingCode?.isNotBlank() == true) {
+            InfoLine(label = "Pending code", value = telegram?.pairingCode.orEmpty(), monospace = true)
+          }
+          if (telegram?.pairingChatId?.isNotBlank() == true) {
+            InfoLine(label = "Pending chat", value = telegram?.pairingChatId.orEmpty(), monospace = true)
+          }
+          if (telegram?.chatId?.isNotBlank() == true) {
+            InfoLine(label = "Approved chat", value = telegram?.chatId.orEmpty(), monospace = true)
+          }
+          if (telegram?.lastTestMessage?.isNotBlank() == true) {
+            InfoLine(label = "Last test", value = telegram?.lastTestMessage.orEmpty())
+          }
+          if (telegram?.pairingMessage?.isNotBlank() == true) {
+            Text(telegram?.pairingMessage.orEmpty(), style = mobileCaption1, color = mobileTextSecondary)
+          }
+        }
+      },
+      actions = {
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+          Button(
+            onClick = {
+              scope.launch {
+                approveTelegramPairing()
+              }
+            },
+            enabled = !telegramBusy && !telegramDiscoverBusy && (pairingCodeInput.isNotBlank() || telegram?.pairingPending == true),
+            shape = RoundedCornerShape(12.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = mobileAccent, contentColor = Color.White),
+            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
+          ) {
+            Text("Approve", style = mobileCaption1.copy(fontWeight = FontWeight.Bold))
+          }
+          Button(
+            onClick = {
+              scope.launch {
+                sendTelegramTest()
+              }
+            },
+            enabled = telegram?.pairingApproved == true && !telegramBusy && !telegramDiscoverBusy && !autoBusy,
+            shape = RoundedCornerShape(12.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = mobileSuccess, contentColor = Color.White),
+            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
+          ) {
+            Text("Send Test", style = mobileCaption1.copy(fontWeight = FontWeight.Bold))
           }
         }
       },
@@ -842,9 +1029,9 @@ fun LocalGatewaySetupWizard(
         Text("Next Step", style = mobileHeadline, color = mobileText)
         Text(
           if (allDone) {
-            "All three steps passed. Continue into the app and use the existing Connect tab for any advanced or remote setup."
+            "Gateway start, OAuth, model selection, Telegram bot setup, and pairing test are all green. Continue into the app for advanced or remote setup."
           } else {
-            "You can skip into the app at any time, but ChatGPT login and Telegram test should be green before calling this setup done."
+            "You can skip into the app at any time, but the Android-local scaffold should be running, the model should be saved, and Telegram pairing/test should be green before calling this setup done."
           },
           style = mobileCallout,
           color = mobileTextSecondary,

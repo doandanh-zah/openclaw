@@ -74,12 +74,17 @@ class GatewayLocalService : Service() {
   private var oauthLastError: String = ""
   private var oauthStartedAtMs: Long = 0L
   private var oauthCompletedAtMs: Long = 0L
+  private var defaultModel: String = ""
   private var lastInboundText: String = ""
   private var lastOutboundText: String = ""
   private var lastTelegramError: String = ""
   private var telegramLastTestOk: Boolean = false
   private var telegramLastTestAtMs: Long = 0L
   private var telegramLastTestMessage: String = ""
+  private var telegramPairingCode: String = ""
+  private var telegramPairingChatId: String = ""
+  private var telegramPairingRequestedAtMs: Long = 0L
+  private var telegramPairingApprovedAtMs: Long = 0L
   private val oauthLock = Any()
   private val serverLock = Any()
 
@@ -105,6 +110,7 @@ class GatewayLocalService : Service() {
     oauthLastError = prefs.getString("gateway.local.oauth.lastError", "") ?: ""
     oauthStartedAtMs = prefs.getLong("gateway.local.oauth.startedAtMs", 0L)
     oauthCompletedAtMs = prefs.getLong("gateway.local.oauth.completedAtMs", 0L)
+    defaultModel = prefs.getString("gateway.local.model.default", "") ?: ""
     telegramLastUpdateId = prefs.getLong("telegramLastUpdateId", 0L)
     telegramHandledCount = prefs.getLong("telegramHandledCount", 0L)
     telegramPollingRequested = prefs.getBoolean("telegramPollingRequested", false)
@@ -114,6 +120,10 @@ class GatewayLocalService : Service() {
     telegramLastTestOk = prefs.getBoolean("gateway.local.telegram.lastTestOk", false)
     telegramLastTestAtMs = prefs.getLong("gateway.local.telegram.lastTestAtMs", 0L)
     telegramLastTestMessage = prefs.getString("gateway.local.telegram.lastTestMessage", "") ?: ""
+    telegramPairingCode = prefs.getString("gateway.local.telegram.pairing.code", "") ?: ""
+    telegramPairingChatId = prefs.getString("gateway.local.telegram.pairing.chatId", "") ?: ""
+    telegramPairingRequestedAtMs = prefs.getLong("gateway.local.telegram.pairing.requestedAtMs", 0L)
+    telegramPairingApprovedAtMs = prefs.getLong("gateway.local.telegram.pairing.approvedAtMs", 0L)
 
     securePrefs.putString("gateway.local.token", localToken)
     tokenRef.set(localToken)
@@ -132,6 +142,7 @@ class GatewayLocalService : Service() {
       oauthLastError = "ChatGPT login expired after restart. Start the QR login again."
       persistOauthState()
     }
+    cleanupExpiredTelegramPairing()
 
     ensureChannel()
     startForeground(NOTIFICATION_ID, buildNotification("Starting local gateway…"))
@@ -300,7 +311,9 @@ class GatewayLocalService : Service() {
       val requestLine = reader.readLine() ?: return
       val parts = requestLine.split(" ")
       val method = parts.getOrNull(0) ?: "GET"
-      val path = parts.getOrNull(1) ?: "/"
+      val target = parts.getOrNull(1) ?: "/"
+      val path = target.substringBefore('?')
+      val query = target.substringAfter('?', "")
 
       val headers = mutableMapOf<String, String>()
       while (true) {
@@ -317,7 +330,12 @@ class GatewayLocalService : Service() {
       val body = readBody(reader, headers)
 
       when {
-        path == "/" -> sendText(out, 200, "OpenClaw Android local gateway alive\n")
+        path == "/" -> sendHtml(out, 200, buildGatewayProofHtml())
+        path == "/proof" -> sendHtml(out, 200, buildGatewayProofHtml())
+        path == "/chat" -> {
+          val sessionKey = queryField(query, "session").ifBlank { "main" }
+          sendHtml(out, 200, buildGatewayProofHtml(sessionKey = sessionKey, desktopChatRoute = true))
+        }
         path == "/health" -> sendJson(out, 200, "{\"ok\":true,\"service\":\"gateway-local\"}")
         path == "/status" -> sendJson(out, 200, baseStatusJson())
         path == "/token" && method == "GET" -> {
@@ -437,6 +455,31 @@ class GatewayLocalService : Service() {
             sendJson(out, 200, "{\"ok\":true,\"message\":\"OAuth state cleared\"}")
           }
         }
+        path == "/v1/model/default" && method == "GET" -> {
+          if (!authorized(headers)) {
+            sendJson(out, 401, "{\"error\":\"unauthorized\"}")
+          } else {
+            sendJson(out, 200, modelStatusJson())
+          }
+        }
+        path == "/v1/model/default" && method == "POST" -> {
+          if (!authorized(headers)) {
+            sendJson(out, 401, "{\"error\":\"unauthorized\"}")
+          } else {
+            val requestedModel = jsonField(body, "model").trim()
+            if (requestedModel.isBlank()) {
+              sendJson(out, 400, "{\"error\":\"invalid_payload\",\"need\":[\"model\"]}")
+            } else {
+              defaultModel = capText(requestedModel, 120)
+              persistModelState()
+              sendJson(
+                out,
+                200,
+                "{\"ok\":true,\"selected\":\"${escapeJson(defaultModel)}\",\"message\":\"Default model saved\"}",
+              )
+            }
+          }
+        }
         path == "/v1/gateway/start" && method == "POST" -> {
           if (!authorized(headers)) {
             sendJson(out, 401, "{\"error\":\"unauthorized\"}")
@@ -471,6 +514,59 @@ class GatewayLocalService : Service() {
             )
           }
         }
+        path == "/v1/telegram/token" && method == "POST" -> {
+          if (!authorized(headers)) {
+            sendJson(out, 401, "{\"error\":\"unauthorized\"}")
+          } else {
+            val bot = jsonField(body, "botToken").trim()
+            val startPolling = jsonBooleanField(body, "startPolling")
+            if (bot.isBlank()) {
+              sendJson(out, 400, "{\"error\":\"invalid_payload\",\"need\":[\"botToken\"]}")
+            } else {
+              setTelegramBotToken(bot)
+              if (startPolling) {
+                telegramPollingRequested = true
+                prefs.edit { putBoolean("telegramPollingRequested", true) }
+                startTelegramPolling()
+              }
+              sendJson(
+                out,
+                200,
+                "{\"ok\":true,\"botTokenReady\":true,\"polling\":${telegramPolling || telegramPollingRequested},\"message\":\"Telegram bot saved. Send /start to the bot, then approve the pairing code in the app.\"}",
+              )
+            }
+          }
+        }
+        path == "/v1/telegram/pairing/status" && method == "GET" -> {
+          if (!authorized(headers)) {
+            sendJson(out, 401, "{\"error\":\"unauthorized\"}")
+          } else {
+            sendJson(out, 200, telegramPairingStatusJson())
+          }
+        }
+        path == "/v1/telegram/pairing/approve" && method == "POST" -> {
+          if (!authorized(headers)) {
+            sendJson(out, 401, "{\"error\":\"unauthorized\"}")
+          } else {
+            cleanupExpiredTelegramPairing()
+            val code = jsonField(body, "code").trim()
+            when {
+              code.isBlank() -> sendJson(out, 400, "{\"error\":\"invalid_payload\",\"need\":[\"code\"]}")
+              telegramPairingCode.isBlank() || telegramPairingChatId.isBlank() ->
+                sendJson(out, 404, "{\"error\":\"pairing_not_pending\",\"message\":\"No pending Telegram pairing request\"}")
+              !telegramPairingCode.equals(code, ignoreCase = true) ->
+                sendJson(out, 409, "{\"error\":\"pairing_code_mismatch\",\"message\":\"Pairing code does not match\"}")
+              else -> {
+                applyApprovedTelegramChat(telegramPairingChatId)
+                sendJson(
+                  out,
+                  200,
+                  "{\"ok\":true,\"chatId\":\"${escapeJson(telegramChatId)}\",\"message\":\"Telegram pairing approved\"}",
+                )
+              }
+            }
+          }
+        }
         path == "/v1/config/telegram" && method == "POST" -> {
           if (!authorized(headers)) {
             sendJson(out, 401, "{\"error\":\"unauthorized\"}")
@@ -481,9 +577,8 @@ class GatewayLocalService : Service() {
             if (bot.isBlank() || chat.isBlank()) {
               sendJson(out, 400, "{\"error\":\"invalid_payload\",\"need\":[\"botToken\",\"chatId\"]}")
             } else {
-              telegramBotToken = bot
-              telegramChatId = chat
-              persistTelegramConfig()
+              setTelegramBotToken(bot)
+              applyApprovedTelegramChat(chat)
               if (startPolling) {
                 telegramPollingRequested = true
                 prefs.edit { putBoolean("telegramPollingRequested", true) }
@@ -518,9 +613,8 @@ class GatewayLocalService : Service() {
             if (bot.isBlank() || chat.isBlank()) {
               sendJson(out, 400, "{\"error\":\"invalid_payload\",\"need\":[\"botToken\",\"chatId\"]}")
             } else {
-              telegramBotToken = bot
-              telegramChatId = chat
-              persistTelegramConfig()
+              setTelegramBotToken(bot)
+              applyApprovedTelegramChat(chat)
               telegramPollingRequested = true
               prefs.edit { putBoolean("telegramPollingRequested", true) }
               startTelegramPolling()
@@ -684,6 +778,8 @@ class GatewayLocalService : Service() {
       "\"port\":$PORT," +
       "\"running\":${isRunning.get()}," +
       "\"mode\":\"scaffold\"," +
+      "\"kind\":\"android-local-scaffold\"," +
+      "\"installState\":\"bundled-apk\"," +
       "\"tokenReady\":${localToken.isNotBlank()}," +
       "\"telegramConfigured\":${telegramBotToken.isNotBlank() && telegramChatId.isNotBlank()}," +
       "\"telegramPolling\":$telegramPolling," +
@@ -692,30 +788,50 @@ class GatewayLocalService : Service() {
       "\"networkMode\":\"${escapeJson(gatewayNetworkMode)}\"," +
       "\"bindHost\":\"${escapeJson(gatewayBindLabel())}\"," +
       "\"localUrl\":\"${escapeJson(localGatewayUrl())}\"," +
-      "\"lanUrl\":\"${escapeJson(lanGatewayUrl())}\"" +
+      "\"lanUrl\":\"${escapeJson(lanGatewayUrl())}\"," +
+      "\"proofUrl\":\"${escapeJson(localGatewayProofUrl())}\"," +
+      "\"chatUrl\":\"${escapeJson(localGatewayChatUrl())}\"," +
+      "\"controlUiReady\":false," +
+      "\"chatPathReady\":false," +
+      "\"chatPathMessage\":\"${escapeJson(chatPathMessage())}\"" +
       "}"
 
   private fun gatewayStatusJson(message: String = ""): String =
     "{\"ok\":true," +
       "\"running\":${isRunning.get()}," +
       "\"port\":$PORT," +
+      "\"kind\":\"android-local-scaffold\"," +
+      "\"installState\":\"bundled-apk\"," +
       "\"networkMode\":\"${escapeJson(gatewayNetworkMode)}\"," +
       "\"bindHost\":\"${escapeJson(gatewayBindLabel())}\"," +
       "\"localUrl\":\"${escapeJson(localGatewayUrl())}\"," +
       "\"lanUrl\":\"${escapeJson(lanGatewayUrl())}\"," +
+      "\"proofUrl\":\"${escapeJson(localGatewayProofUrl())}\"," +
+      "\"chatUrl\":\"${escapeJson(localGatewayChatUrl())}\"," +
+      "\"controlUiReady\":false," +
+      "\"chatPathReady\":false," +
+      "\"chatPathMessage\":\"${escapeJson(chatPathMessage())}\"," +
       "\"message\":\"${escapeJson(message)}\"" +
       "}"
 
-  private fun wizardStatusJson(): String =
-    "{\"ok\":true," +
+  private fun wizardStatusJson(): String {
+    cleanupExpiredTelegramPairing()
+    return "{\"ok\":true," +
       "\"gateway\":{" +
       "\"running\":${isRunning.get()}," +
       "\"port\":$PORT," +
       "\"tokenReady\":${localToken.isNotBlank()}," +
+      "\"kind\":\"android-local-scaffold\"," +
+      "\"installState\":\"bundled-apk\"," +
       "\"networkMode\":\"${escapeJson(gatewayNetworkMode)}\"," +
       "\"bindHost\":\"${escapeJson(gatewayBindLabel())}\"," +
       "\"localUrl\":\"${escapeJson(localGatewayUrl())}\"," +
-      "\"lanUrl\":\"${escapeJson(lanGatewayUrl())}\"" +
+      "\"lanUrl\":\"${escapeJson(lanGatewayUrl())}\"," +
+      "\"proofUrl\":\"${escapeJson(localGatewayProofUrl())}\"," +
+      "\"chatUrl\":\"${escapeJson(localGatewayChatUrl())}\"," +
+      "\"controlUiReady\":false," +
+      "\"chatPathReady\":false," +
+      "\"chatPathMessage\":\"${escapeJson(chatPathMessage())}\"" +
       "}," +
       "\"oauth\":{" +
       "\"ready\":${oauthSessionReady()}," +
@@ -733,8 +849,15 @@ class GatewayLocalService : Service() {
       "\"startedAtMs\":$oauthStartedAtMs," +
       "\"completedAtMs\":$oauthCompletedAtMs" +
       "}," +
+      "\"model\":{" +
+      "\"selected\":\"${escapeJson(defaultModel)}\"," +
+      "\"ready\":${defaultModel.isNotBlank()}," +
+      "\"message\":\"${escapeJson(modelSelectionMessage())}\"," +
+      "\"suggested\":" + jsonArrayJson(DEFAULT_MODEL_CHOICES) +
+      "}," +
       "\"telegram\":{" +
       "\"configured\":${telegramBotToken.isNotBlank() && telegramChatId.isNotBlank()}," +
+      "\"botTokenReady\":${telegramBotToken.isNotBlank()}," +
       "\"polling\":$telegramPolling," +
       "\"requested\":$telegramPollingRequested," +
       "\"chatId\":\"${escapeJson(telegramChatId)}\"," +
@@ -745,9 +868,17 @@ class GatewayLocalService : Service() {
       "\"lastOutbound\":\"${escapeJson(lastOutboundText)}\"," +
       "\"lastTestOk\":$telegramLastTestOk," +
       "\"lastTestAtMs\":$telegramLastTestAtMs," +
-      "\"lastTestMessage\":\"${escapeJson(telegramLastTestMessage)}\"" +
+      "\"lastTestMessage\":\"${escapeJson(telegramLastTestMessage)}\"," +
+      "\"pairingApproved\":${telegramChatId.isNotBlank()}," +
+      "\"pairingPending\":${telegramPairingCode.isNotBlank()}," +
+      "\"pairingCode\":\"${escapeJson(telegramPairingCode)}\"," +
+      "\"pairingChatId\":\"${escapeJson(telegramPairingChatId)}\"," +
+      "\"pairingRequestedAtMs\":$telegramPairingRequestedAtMs," +
+      "\"pairingApprovedAtMs\":$telegramPairingApprovedAtMs," +
+      "\"pairingMessage\":\"${escapeJson(telegramPairingMessage())}\"" +
       "}" +
       "}"
+  }
 
   private fun oauthStatusJson(): String =
     "{\"ok\":true," +
@@ -766,6 +897,33 @@ class GatewayLocalService : Service() {
       "\"startedAtMs\":$oauthStartedAtMs," +
       "\"completedAtMs\":$oauthCompletedAtMs" +
       "}"
+
+  private fun modelStatusJson(): String =
+    "{\"ok\":true," +
+      "\"selected\":\"${escapeJson(defaultModel)}\"," +
+      "\"ready\":${defaultModel.isNotBlank()}," +
+      "\"message\":\"${escapeJson(modelSelectionMessage())}\"," +
+      "\"suggested\":" + jsonArrayJson(DEFAULT_MODEL_CHOICES) +
+      "}"
+
+  private fun telegramPairingStatusJson(): String {
+    cleanupExpiredTelegramPairing()
+    return "{\"ok\":true," +
+      "\"botTokenReady\":${telegramBotToken.isNotBlank()}," +
+      "\"approved\":${telegramChatId.isNotBlank()}," +
+      "\"chatId\":\"${escapeJson(telegramChatId)}\"," +
+      "\"pending\":${telegramPairingCode.isNotBlank()}," +
+      "\"code\":\"${escapeJson(telegramPairingCode)}\"," +
+      "\"pendingChatId\":\"${escapeJson(telegramPairingChatId)}\"," +
+      "\"requestedAtMs\":$telegramPairingRequestedAtMs," +
+      "\"approvedAtMs\":$telegramPairingApprovedAtMs," +
+      "\"message\":\"${escapeJson(telegramPairingMessage())}\"" +
+      "}"
+  }
+
+  private fun persistModelState() {
+    prefs.edit { putString("gateway.local.model.default", defaultModel) }
+  }
 
   private fun persistOauthState() {
     securePrefs.putString("gateway.local.oauth.accessToken", oauthAccessToken)
@@ -1020,8 +1178,21 @@ class GatewayLocalService : Service() {
 
   private fun persistTelegramConfig() {
     securePrefs.putString("gateway.local.telegram.botToken", telegramBotToken)
-    prefs.edit { putString("telegramChatId", telegramChatId) }
+    prefs.edit {
+      putString("telegramChatId", telegramChatId)
+      putLong("gateway.local.telegram.pairing.approvedAtMs", telegramPairingApprovedAtMs)
+    }
+    persistTelegramPairingState()
     persistTelegramDiagnostics()
+  }
+
+  private fun persistTelegramPairingState() {
+    prefs.edit {
+      putString("gateway.local.telegram.pairing.code", telegramPairingCode)
+      putString("gateway.local.telegram.pairing.chatId", telegramPairingChatId)
+      putLong("gateway.local.telegram.pairing.requestedAtMs", telegramPairingRequestedAtMs)
+      putLong("gateway.local.telegram.pairing.approvedAtMs", telegramPairingApprovedAtMs)
+    }
   }
 
   private fun persistTelegramDiagnostics() {
@@ -1040,6 +1211,10 @@ class GatewayLocalService : Service() {
     telegramPollingRequested = false
     telegramBotToken = ""
     telegramChatId = ""
+    telegramPairingCode = ""
+    telegramPairingChatId = ""
+    telegramPairingRequestedAtMs = 0L
+    telegramPairingApprovedAtMs = 0L
     telegramLastUpdateId = 0L
     telegramHandledCount = 0L
     lastInboundText = ""
@@ -1060,6 +1235,10 @@ class GatewayLocalService : Service() {
       putBoolean("gateway.local.telegram.lastTestOk", false)
       putLong("gateway.local.telegram.lastTestAtMs", 0L)
       putString("gateway.local.telegram.lastTestMessage", "")
+      putString("gateway.local.telegram.pairing.code", "")
+      putString("gateway.local.telegram.pairing.chatId", "")
+      putLong("gateway.local.telegram.pairing.requestedAtMs", 0L)
+      putLong("gateway.local.telegram.pairing.approvedAtMs", 0L)
     }
   }
 
@@ -1133,6 +1312,94 @@ class GatewayLocalService : Service() {
       "<title>Authentication failed</title></head><body>" +
       "<p>${escapeHtml(message)}</p></body></html>"
 
+  private fun buildGatewayProofHtml(sessionKey: String = "main", desktopChatRoute: Boolean = false): String {
+    cleanupExpiredTelegramPairing()
+    val sessionLabel = sessionKey.trim().ifEmpty { "main" }
+    val gatewayUrl = localGatewayUrl()
+    val proofUrl = localGatewayProofUrl()
+    val chatUrl = localGatewayChatUrl(sessionLabel)
+    val title =
+      if (desktopChatRoute) {
+        "OpenClaw Android local chat route"
+      } else {
+        "OpenClaw Android local gateway"
+      }
+    val routeNote =
+      if (desktopChatRoute) {
+        "You opened the desktop-style chat URL for session <code>${escapeHtml(sessionLabel)}</code>. On Android this route currently serves a proof page only."
+      } else {
+        "This page proves the Android-local gateway scaffold is running on <code>$gatewayUrl</code>."
+      }
+    val oauthState =
+      when {
+        oauthSessionReady() -> "ready"
+        oauthPending -> "pending"
+        else -> "not linked"
+      }
+    val telegramState =
+      when {
+        telegramChatId.isNotBlank() -> "approved chat $telegramChatId"
+        telegramPairingCode.isNotBlank() -> "pending code $telegramPairingCode"
+        telegramBotToken.isNotBlank() -> "token saved, waiting for /start"
+        else -> "not configured"
+      }
+    return """
+      <!doctype html>
+      <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>$title</title>
+        <style>
+          :root { color-scheme: light; }
+          body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f5f6f7; color: #101418; }
+          main { max-width: 760px; margin: 0 auto; padding: 24px 18px 40px; }
+          .card { background: #ffffff; border: 1px solid #d7dce1; border-radius: 16px; padding: 18px; margin-top: 14px; }
+          h1 { margin: 0 0 10px; font-size: 28px; line-height: 1.15; }
+          h2 { margin: 0 0 10px; font-size: 18px; }
+          p, li { line-height: 1.5; }
+          code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: #eef2f5; padding: 2px 6px; border-radius: 6px; }
+          ul { padding-left: 18px; margin: 10px 0 0; }
+          .warn { background: #fff3e6; border-color: #f2c48d; }
+        </style>
+      </head>
+      <body>
+        <main>
+          <div class="card">
+            <h1>$title</h1>
+            <p>$routeNote</p>
+            <p>${escapeHtml(chatPathMessage())}</p>
+          </div>
+          <div class="card warn">
+            <h2>Desktop parity</h2>
+            <p>The APK bundles the Android-local HTTP scaffold. It does not embed the real desktop OpenClaw WebSocket gateway or Control UI assets yet.</p>
+          </div>
+          <div class="card">
+            <h2>Runtime status</h2>
+            <ul>
+              <li>Install: <code>bundled-apk</code></li>
+              <li>Running: <code>${isRunning.get()}</code></li>
+              <li>Bind: <code>${escapeHtml(gatewayBindLabel())}:$PORT</code></li>
+              <li>OAuth: <code>${escapeHtml(oauthState)}</code></li>
+              <li>Default model: <code>${escapeHtml(defaultModel.ifBlank { "not selected" })}</code></li>
+              <li>Telegram: <code>${escapeHtml(telegramState)}</code></li>
+            </ul>
+          </div>
+          <div class="card">
+            <h2>Useful local routes</h2>
+            <ul>
+              <li><a href="$proofUrl">$proofUrl</a></li>
+              <li><a href="$chatUrl">$chatUrl</a></li>
+              <li><a href="/health">/health</a></li>
+              <li><a href="/status">/status</a></li>
+            </ul>
+          </div>
+        </main>
+      </body>
+      </html>
+    """.trimIndent()
+  }
+
   private fun queryField(query: String, key: String): String {
     if (query.isBlank()) return ""
     val prefix = "$key="
@@ -1160,6 +1427,11 @@ class GatewayLocalService : Service() {
     }
 
   private fun localGatewayUrl(): String = "http://127.0.0.1:$PORT"
+
+  private fun localGatewayProofUrl(): String = "${localGatewayUrl()}/proof"
+
+  private fun localGatewayChatUrl(sessionKey: String = "main"): String =
+    "${localGatewayUrl()}/chat?session=${urlEncode(sessionKey)}"
 
   private fun lanGatewayUrl(): String {
     val host = discoverLanIpv4Address().ifBlank { return "" }
@@ -1206,6 +1478,106 @@ class GatewayLocalService : Service() {
   private fun capText(value: String, maxLen: Int = 500): String {
     val trimmed = value.trim()
     return if (trimmed.length <= maxLen) trimmed else trimmed.take(maxLen)
+  }
+
+  private fun chatPathMessage(): String =
+    "Desktop /chat is reserved on Android-local. This APK currently serves a proof page there while the real WebSocket gateway and Control UI are still missing."
+
+  private fun modelSelectionMessage(): String =
+    if (defaultModel.isBlank()) {
+      "Choose the default model after OAuth so the Android setup matches desktop onboarding semantics."
+    } else {
+      "Default model stored locally as $defaultModel."
+    }
+
+  private fun telegramPairingMessage(): String =
+    when {
+      telegramChatId.isNotBlank() ->
+        "Pairing approved for chat $telegramChatId. This Android-local scaffold will only answer that Telegram DM."
+      telegramPairingCode.isNotBlank() ->
+        "Pending pairing code ${telegramPairingCode}. Send /start to the bot, then approve this code in the app."
+      telegramBotToken.isBlank() ->
+        "Save the Telegram bot token first."
+      else ->
+        "Bot token saved. Send /start to the bot so the app can generate a pairing code."
+    }
+
+  private fun jsonArrayJson(values: List<String>): String =
+    values.joinToString(prefix = "[", postfix = "]") { "\"${escapeJson(it)}\"" }
+
+  private fun setTelegramBotToken(botToken: String) {
+    val next = botToken.trim()
+    val changed = telegramBotToken != next
+    telegramBotToken = next
+    if (changed) {
+      telegramChatId = ""
+      telegramPairingApprovedAtMs = 0L
+      clearPendingTelegramPairing()
+      telegramLastUpdateId = 0L
+      telegramLastTestOk = false
+      telegramLastTestAtMs = 0L
+      telegramLastTestMessage = ""
+    }
+    persistTelegramConfig()
+  }
+
+  private fun clearPendingTelegramPairing() {
+    telegramPairingCode = ""
+    telegramPairingChatId = ""
+    telegramPairingRequestedAtMs = 0L
+    persistTelegramPairingState()
+  }
+
+  private fun applyApprovedTelegramChat(chatId: String) {
+    telegramChatId = chatId.trim()
+    telegramPairingApprovedAtMs = System.currentTimeMillis()
+    val pendingChat = telegramPairingChatId
+    clearPendingTelegramPairing()
+    persistTelegramConfig()
+    if (telegramBotToken.isNotBlank() && telegramChatId.isNotBlank()) {
+      val notifyText =
+        if (pendingChat == telegramChatId) {
+          "✅ Telegram pairing approved from the Android app. You can now DM this bot."
+        } else {
+          "✅ Telegram chat approved from the Android app."
+        }
+      sendTelegramMessage(telegramChatId, notifyText)
+    }
+  }
+
+  private fun cleanupExpiredTelegramPairing() {
+    if (telegramPairingCode.isBlank()) return
+    val ageMs = System.currentTimeMillis() - telegramPairingRequestedAtMs
+    if (telegramPairingRequestedAtMs <= 0L || ageMs >= TELEGRAM_PAIRING_EXPIRY_MS) {
+      clearPendingTelegramPairing()
+    }
+  }
+
+  private fun generateTelegramPairingCode(length: Int = 8): String =
+    buildString {
+      repeat(length) {
+        val index = (Math.random() * TELEGRAM_PAIRING_ALPHABET.length).toInt()
+        append(TELEGRAM_PAIRING_ALPHABET[index])
+      }
+    }
+
+  private fun ensureTelegramPairingRequest(chatId: String): String {
+    cleanupExpiredTelegramPairing()
+    val now = System.currentTimeMillis()
+    if (
+      telegramPairingCode.isNotBlank() &&
+      telegramPairingChatId.isNotBlank() &&
+      telegramPairingChatId != chatId
+    ) {
+      return "⏳ Another Telegram pairing request is already waiting in the app. Ask the owner to approve it or retry later."
+    }
+    if (telegramPairingCode.isBlank() || telegramPairingChatId != chatId) {
+      telegramPairingCode = generateTelegramPairingCode()
+      telegramPairingChatId = chatId
+      telegramPairingRequestedAtMs = now
+      persistTelegramPairingState()
+    }
+    return "🔐 Pairing required. Approval code: $telegramPairingCode. Open the Android app and tap Approve Pairing."
   }
 
   private fun sendTelegramMessage(chatId: String, text: String): Boolean {
@@ -1286,17 +1658,23 @@ class GatewayLocalService : Service() {
   private fun handleIncomingTelegramMessage(chatId: String, text: String) {
     lastInboundText = capText(text)
     val trimmed = text.trim()
+    if (telegramChatId.isBlank() || telegramChatId != chatId) {
+      lastOutboundText = capText(ensureTelegramPairingRequest(chatId))
+      persistTelegramDiagnostics()
+      sendTelegramMessage(chatId, lastOutboundText)
+      return
+    }
     lastOutboundText =
       capText(
         when {
           trimmed.equals("/start", ignoreCase = true) ->
-            "✅ OpenClaw local gateway is online on Android. Send /status to check health."
+            "✅ OpenClaw Android local gateway is online. This build is still the Android-local scaffold, not the full desktop WebSocket gateway."
           trimmed.equals("/status", ignoreCase = true) ->
-            "📡 Gateway: running=${isRunning.get()} | polling=$telegramPolling | updateId=$telegramLastUpdateId"
+            "📡 Gateway running=${isRunning.get()} | oauth=${oauthSessionReady()} | model=${defaultModel.ifBlank { "not selected" }} | poll=$telegramPolling"
           trimmed.equals("/help", ignoreCase = true) ->
-            "Commands: /start /status /help"
+            "Commands: /start /status /help. Desktop chat/control UI is not embedded yet in this Android-local scaffold."
           else ->
-            "[android-local] received: $trimmed"
+            "[android-local scaffold] received: $trimmed\nDesktop chat/control UI is still pending on Android."
         },
       )
     persistTelegramDiagnostics()
@@ -1400,9 +1778,17 @@ class GatewayLocalService : Service() {
     private const val OAUTH_CALLBACK_PORT = 1455
     private const val OAUTH_CALLBACK_PATH = "/auth/callback"
     private const val OAUTH_EXPIRY_SKEW_MS = 60_000L
+    private const val TELEGRAM_PAIRING_EXPIRY_MS = 60 * 60 * 1000L
+    private const val TELEGRAM_PAIRING_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     const val NETWORK_MODE_LOCAL = "local"
     const val NETWORK_MODE_LAN = "lan"
     const val PORT = 18789
+    val DEFAULT_MODEL_CHOICES =
+      listOf(
+        "openai-codex/gpt-5.4",
+        "openai-codex/gpt-5.3-codex",
+        "openai-codex/gpt-5.2-codex",
+      )
 
     private val isRunning = AtomicBoolean(false)
     private val tokenRef = AtomicReference("")

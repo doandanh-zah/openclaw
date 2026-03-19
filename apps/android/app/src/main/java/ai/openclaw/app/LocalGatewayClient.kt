@@ -4,11 +4,12 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.longOrNull
 
@@ -26,10 +27,17 @@ object LocalGatewayClient {
     val running: Boolean,
     val port: Int,
     val tokenReady: Boolean,
+    val kind: String,
+    val installState: String,
     val networkMode: String,
     val bindHost: String,
     val localUrl: String,
     val lanUrl: String,
+    val proofUrl: String,
+    val chatUrl: String,
+    val controlUiReady: Boolean,
+    val chatPathReady: Boolean,
+    val chatPathMessage: String,
   )
 
   data class OAuthSummary(
@@ -46,8 +54,16 @@ object LocalGatewayClient {
     val completedAtMs: Long,
   )
 
+  data class ModelSummary(
+    val selected: String,
+    val ready: Boolean,
+    val message: String,
+    val suggested: List<String>,
+  )
+
   data class TelegramSummary(
     val configured: Boolean,
+    val botTokenReady: Boolean,
     val polling: Boolean,
     val requested: Boolean,
     val chatId: String,
@@ -59,11 +75,19 @@ object LocalGatewayClient {
     val lastTestOk: Boolean,
     val lastTestAtMs: Long,
     val lastTestMessage: String,
+    val pairingApproved: Boolean,
+    val pairingPending: Boolean,
+    val pairingCode: String,
+    val pairingChatId: String,
+    val pairingRequestedAtMs: Long,
+    val pairingApprovedAtMs: Long,
+    val pairingMessage: String,
   )
 
   data class WizardSnapshot(
     val gateway: GatewaySummary,
     val oauth: OAuthSummary,
+    val model: ModelSummary,
     val telegram: TelegramSummary,
   )
 
@@ -149,6 +173,12 @@ object LocalGatewayClient {
 
   private fun JsonObject.long(key: String): Long =
     string(key).toLongOrNull() ?: ((get(key) as? JsonPrimitive)?.longOrNull ?: 0L)
+
+  private fun JsonObject.stringList(key: String): List<String> =
+    (get(key) as? JsonArray)
+      ?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull?.trim() }
+      ?.filter { it.isNotEmpty() }
+      .orEmpty()
 
   fun getLocalToken(): String {
     return try {
@@ -253,6 +283,12 @@ object LocalGatewayClient {
     return simpleMessageResult(result, successMessage = "OAuth reset")
   }
 
+  fun setDefaultModel(model: String): ApiResult<String> {
+    val payload = """{"model":"${escape(model)}"}"""
+    val result = requestAuthorized("POST", "/v1/model/default", body = payload)
+    return simpleMessageResult(result, successMessage = "Default model saved")
+  }
+
   fun setGatewayNetworkMode(networkMode: String): ApiResult<GatewaySummary> {
     val payload = """{"networkMode":"${escape(networkMode)}"}"""
     val result = requestAuthorized("POST", "/v1/gateway/network-mode", body = payload)
@@ -266,10 +302,17 @@ object LocalGatewayClient {
         running = obj.boolean("running"),
         port = obj.int("port"),
         tokenReady = getLocalToken().isNotBlank(),
+        kind = obj.string("kind").ifBlank { "android-local-scaffold" },
+        installState = obj.string("installState").ifBlank { "bundled-apk" },
         networkMode = obj.string("networkMode").ifBlank { GatewayLocalService.NETWORK_MODE_LOCAL },
         bindHost = obj.string("bindHost"),
         localUrl = obj.string("localUrl"),
         lanUrl = obj.string("lanUrl"),
+        proofUrl = obj.string("proofUrl"),
+        chatUrl = obj.string("chatUrl"),
+        controlUiReady = obj.boolean("controlUiReady"),
+        chatPathReady = obj.boolean("chatPathReady"),
+        chatPathMessage = obj.string("chatPathMessage"),
       )
     return ApiResult(
       ok = true,
@@ -284,6 +327,19 @@ object LocalGatewayClient {
       """{"botToken":"${escape(botToken)}","chatId":"${escape(chatId)}","startPolling":$startPolling}"""
     val result = requestAuthorized("POST", "/v1/config/telegram", payload)
     return simpleMessageResult(result, successMessage = "Telegram configured")
+  }
+
+  fun saveTelegramBotToken(botToken: String, startPolling: Boolean = true): ApiResult<String> {
+    val payload =
+      """{"botToken":"${escape(botToken)}","startPolling":$startPolling}"""
+    val result = requestAuthorized("POST", "/v1/telegram/token", payload)
+    return simpleMessageResult(result, successMessage = "Telegram bot saved")
+  }
+
+  fun approveTelegramPairing(code: String): ApiResult<String> {
+    val payload = """{"code":"${escape(code)}"}"""
+    val result = requestAuthorized("POST", "/v1/telegram/pairing/approve", payload)
+    return simpleMessageResult(result, successMessage = "Telegram pairing approved")
   }
 
   fun quickstartTelegram(botToken: String, chatId: String): ApiResult<String> {
@@ -378,6 +434,7 @@ object LocalGatewayClient {
   private fun parseWizardSnapshot(root: JsonObject): WizardSnapshot {
     val gatewayObj = root["gateway"]?.jsonObject ?: JsonObject(emptyMap())
     val oauthObj = root["oauth"]?.jsonObject ?: JsonObject(emptyMap())
+    val modelObj = root["model"]?.jsonObject ?: JsonObject(emptyMap())
     val telegramObj = root["telegram"]?.jsonObject ?: JsonObject(emptyMap())
     return WizardSnapshot(
       gateway =
@@ -385,10 +442,17 @@ object LocalGatewayClient {
           running = gatewayObj.boolean("running"),
           port = gatewayObj.int("port"),
           tokenReady = gatewayObj.boolean("tokenReady"),
+          kind = gatewayObj.string("kind").ifBlank { "android-local-scaffold" },
+          installState = gatewayObj.string("installState").ifBlank { "bundled-apk" },
           networkMode = gatewayObj.string("networkMode").ifBlank { GatewayLocalService.NETWORK_MODE_LOCAL },
           bindHost = gatewayObj.string("bindHost"),
           localUrl = gatewayObj.string("localUrl"),
           lanUrl = gatewayObj.string("lanUrl"),
+          proofUrl = gatewayObj.string("proofUrl"),
+          chatUrl = gatewayObj.string("chatUrl"),
+          controlUiReady = gatewayObj.boolean("controlUiReady"),
+          chatPathReady = gatewayObj.boolean("chatPathReady"),
+          chatPathMessage = gatewayObj.string("chatPathMessage"),
         ),
       oauth =
         OAuthSummary(
@@ -404,9 +468,17 @@ object LocalGatewayClient {
           startedAtMs = oauthObj.long("startedAtMs"),
           completedAtMs = oauthObj.long("completedAtMs"),
         ),
+      model =
+        ModelSummary(
+          selected = modelObj.string("selected"),
+          ready = modelObj.boolean("ready"),
+          message = modelObj.string("message"),
+          suggested = modelObj.stringList("suggested"),
+        ),
       telegram =
         TelegramSummary(
           configured = telegramObj.boolean("configured"),
+          botTokenReady = telegramObj.boolean("botTokenReady"),
           polling = telegramObj.boolean("polling"),
           requested = telegramObj.boolean("requested"),
           chatId = telegramObj.string("chatId"),
@@ -418,6 +490,13 @@ object LocalGatewayClient {
           lastTestOk = telegramObj.boolean("lastTestOk"),
           lastTestAtMs = telegramObj.long("lastTestAtMs"),
           lastTestMessage = telegramObj.string("lastTestMessage"),
+          pairingApproved = telegramObj.boolean("pairingApproved"),
+          pairingPending = telegramObj.boolean("pairingPending"),
+          pairingCode = telegramObj.string("pairingCode"),
+          pairingChatId = telegramObj.string("pairingChatId"),
+          pairingRequestedAtMs = telegramObj.long("pairingRequestedAtMs"),
+          pairingApprovedAtMs = telegramObj.long("pairingApprovedAtMs"),
+          pairingMessage = telegramObj.string("pairingMessage"),
         ),
     )
   }
@@ -432,10 +511,17 @@ object LocalGatewayClient {
           running = running,
           port = port,
           tokenReady = tokenReady,
+          kind = root.string("kind").ifBlank { "android-local-scaffold" },
+          installState = root.string("installState").ifBlank { "bundled-apk" },
           networkMode = root.string("networkMode").ifBlank { GatewayLocalService.NETWORK_MODE_LOCAL },
           bindHost = root.string("bindHost"),
           localUrl = root.string("localUrl"),
           lanUrl = root.string("lanUrl"),
+          proofUrl = root.string("proofUrl"),
+          chatUrl = root.string("chatUrl"),
+          controlUiReady = root.boolean("controlUiReady"),
+          chatPathReady = root.boolean("chatPathReady"),
+          chatPathMessage = root.string("chatPathMessage"),
         ),
       oauth =
         OAuthSummary(
@@ -451,9 +537,17 @@ object LocalGatewayClient {
           startedAtMs = 0L,
           completedAtMs = 0L,
         ),
+      model =
+        ModelSummary(
+          selected = "",
+          ready = false,
+          message = "",
+          suggested = emptyList(),
+        ),
       telegram =
         TelegramSummary(
           configured = root.boolean("telegramConfigured"),
+          botTokenReady = root.boolean("telegramConfigured"),
           polling = false,
           requested = false,
           chatId = "",
@@ -465,6 +559,13 @@ object LocalGatewayClient {
           lastTestOk = false,
           lastTestAtMs = 0L,
           lastTestMessage = "",
+          pairingApproved = false,
+          pairingPending = false,
+          pairingCode = "",
+          pairingChatId = "",
+          pairingRequestedAtMs = 0L,
+          pairingApprovedAtMs = 0L,
+          pairingMessage = "",
         ),
     )
   }
