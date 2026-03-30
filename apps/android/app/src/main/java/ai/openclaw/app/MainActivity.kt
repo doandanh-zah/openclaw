@@ -47,8 +47,11 @@ class MainActivity : ComponentActivity() {
       }
     }
 
-    // Keep startup path lean: start foreground service after first frame.
-    window.decorView.post { NodeForegroundService.start(this) }
+    // Keep startup path lean: start foreground services after first frame.
+    window.decorView.post {
+      NodeForegroundService.start(this)
+      GatewayLocalService.start(this)
+    }
   }
 
   override fun onStart() {

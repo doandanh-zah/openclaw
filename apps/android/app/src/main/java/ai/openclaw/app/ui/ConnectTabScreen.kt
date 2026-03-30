@@ -43,13 +43,20 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import ai.openclaw.app.GatewayLocalService
+import ai.openclaw.app.LocalGatewayClient
 import ai.openclaw.app.MainViewModel
 import ai.openclaw.app.ui.mobileCardSurface
 
@@ -60,6 +67,7 @@ private enum class ConnectInputMode {
 
 @Composable
 fun ConnectTabScreen(viewModel: MainViewModel) {
+  val context = LocalContext.current
   val statusText by viewModel.statusText.collectAsState()
   val isConnected by viewModel.isConnected.collectAsState()
   val remoteAddress by viewModel.remoteAddress.collectAsState()
@@ -86,7 +94,27 @@ fun ConnectTabScreen(viewModel: MainViewModel) {
   var manualPortInput by rememberSaveable { mutableStateOf(manualPort.toString()) }
   var manualTlsInput by rememberSaveable { mutableStateOf(manualTls) }
   var passwordInput by rememberSaveable { mutableStateOf("") }
+  var tgBotTokenInput by rememberSaveable { mutableStateOf("") }
+  var tgChatIdInput by rememberSaveable { mutableStateOf("") }
+  var tgDiscoverBusy by rememberSaveable { mutableStateOf(false) }
+  var quickstartStatus by rememberSaveable { mutableStateOf("") }
+  var quickstartBusy by rememberSaveable { mutableStateOf(false) }
   var validationText by rememberSaveable { mutableStateOf<String?>(null) }
+  val scope = rememberCoroutineScope()
+
+  suspend fun ensureLocalGatewayReady(status: String): Boolean {
+    quickstartStatus = status
+    GatewayLocalService.start(context)
+    val result =
+      withContext(Dispatchers.IO) {
+        LocalGatewayClient.waitForGatewayReady(timeoutMs = 10_000)
+      }
+    if (!result.ok) {
+      quickstartStatus = "❌ Local gateway not ready: ${result.message.take(120)}"
+      return false
+    }
+    return true
+  }
 
   if (pendingTrust != null) {
     val prompt = pendingTrust!!
@@ -147,6 +175,176 @@ fun ConnectTabScreen(viewModel: MainViewModel) {
         style = mobileCallout,
         color = mobileTextSecondary,
       )
+    }
+
+    // One-tap local gateway quick start (Android-local fork UX)
+    Surface(
+      modifier = Modifier.fillMaxWidth(),
+      shape = RoundedCornerShape(14.dp),
+      color = mobileCardSurface,
+      border = BorderStroke(1.dp, mobileAccent.copy(alpha = 0.35f)),
+    ) {
+      Column(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+      ) {
+        Text("Android Local Gateway", style = mobileHeadline, color = mobileText)
+        Text(
+          "No laptop/VPS needed. This opens the Android-local gateway on this phone at `:18789`.",
+          style = mobileCallout,
+          color = mobileTextSecondary,
+        )
+        Button(
+          onClick = {
+            inputMode = ConnectInputMode.Manual
+            manualHostInput = "127.0.0.1"
+            manualPortInput = "18789"
+            manualTlsInput = false
+            validationText = null
+            viewModel.setManualEnabled(true)
+            viewModel.setManualHost("127.0.0.1")
+            viewModel.setManualPort(18789)
+            viewModel.setManualTls(false)
+            // Local gateway is HTTP API, not upstream WS gateway handshake.
+            // Open setup wizard instead of attempting WS connect (prevents HTTP 101 error).
+            viewModel.setOnboardingCompleted(false)
+          },
+          modifier = Modifier.fillMaxWidth().height(46.dp),
+          shape = RoundedCornerShape(12.dp),
+          colors =
+            ButtonDefaults.buttonColors(
+              containerColor = mobileAccent,
+              contentColor = Color.White,
+            ),
+        ) {
+          Text("Use Local Gateway Now", style = mobileCallout.copy(fontWeight = FontWeight.Bold))
+        }
+      }
+    }
+
+    Surface(
+      modifier = Modifier.fillMaxWidth(),
+      shape = RoundedCornerShape(14.dp),
+      color = mobileCardSurface,
+      border = BorderStroke(1.dp, mobileBorder),
+    ) {
+      Column(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+      ) {
+        Text("Telegram Quick Setup", style = mobileHeadline, color = mobileText)
+        Text("Legacy quick path: paste Bot Token, then Discover Chat ID after /start. The first-run wizard now prefers token-first plus pairing approval.", style = mobileCallout, color = mobileTextSecondary)
+
+        OutlinedTextField(
+          value = tgBotTokenInput,
+          onValueChange = { tgBotTokenInput = it },
+          placeholder = { Text("Bot token", style = mobileBody, color = mobileTextTertiary) },
+          modifier = Modifier.fillMaxWidth(),
+          singleLine = true,
+          keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
+          textStyle = mobileBody.copy(color = mobileText),
+          shape = RoundedCornerShape(12.dp),
+          colors = outlinedColors(),
+        )
+
+        OutlinedTextField(
+          value = tgChatIdInput,
+          onValueChange = { tgChatIdInput = it },
+          placeholder = { Text("Chat ID", style = mobileBody, color = mobileTextTertiary) },
+          modifier = Modifier.fillMaxWidth(),
+          singleLine = true,
+          keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
+          textStyle = mobileBody.copy(color = mobileText),
+          shape = RoundedCornerShape(12.dp),
+          colors = outlinedColors(),
+        )
+
+        Button(
+          onClick = {
+            tgDiscoverBusy = true
+            quickstartStatus = "Discovering chat id... send /start to your bot first."
+            scope.launch {
+              val result = withContext(Dispatchers.IO) {
+                LocalGatewayClient.discoverTelegramChatId(tgBotTokenInput.trim())
+              }
+              tgDiscoverBusy = false
+              if (result.ok && !result.value.isNullOrBlank()) {
+                tgChatIdInput = result.value
+                quickstartStatus = "✅ Found chat id: ${result.value}"
+              } else {
+                quickstartStatus = "❌ Discover failed: ${result.message.take(120)}"
+              }
+            }
+          },
+          enabled = !tgDiscoverBusy && tgBotTokenInput.isNotBlank(),
+          shape = RoundedCornerShape(12.dp),
+          colors = ButtonDefaults.buttonColors(containerColor = mobileAccentSoft, contentColor = mobileText),
+        ) {
+          Text("Discover Chat ID", style = mobileCaption1.copy(fontWeight = FontWeight.Bold))
+        }
+
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+          Button(
+            onClick = {
+              quickstartBusy = true
+              quickstartStatus = "Running quick setup..."
+              scope.launch {
+                if (!ensureLocalGatewayReady("Starting local gateway for Telegram setup...")) {
+                  quickstartBusy = false
+                  return@launch
+                }
+                val result = withContext(Dispatchers.IO) {
+                  LocalGatewayClient.quickstartTelegram(tgBotTokenInput.trim(), tgChatIdInput.trim())
+                }
+                quickstartBusy = false
+                quickstartStatus =
+                  if (result.ok) {
+                    "✅ Quick setup success"
+                  } else {
+                    "❌ Quick setup failed: ${result.message.take(120)}"
+                  }
+              }
+            },
+            enabled = !quickstartBusy,
+            shape = RoundedCornerShape(12.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = mobileAccent, contentColor = Color.White),
+          ) {
+            Text("Setup & Start", style = mobileCaption1.copy(fontWeight = FontWeight.Bold))
+          }
+
+          Button(
+            onClick = {
+              quickstartBusy = true
+              quickstartStatus = "Sending test..."
+              scope.launch {
+                if (!ensureLocalGatewayReady("Starting local gateway before Telegram test...")) {
+                  quickstartBusy = false
+                  return@launch
+                }
+                val result = withContext(Dispatchers.IO) {
+                  LocalGatewayClient.sendTelegramTest("[openclaw-local] test from one-tap UI")
+                }
+                quickstartBusy = false
+                quickstartStatus =
+                  if (result.ok) {
+                    "✅ Test message sent"
+                  } else {
+                    "❌ Send failed: ${result.message.take(120)}"
+                  }
+              }
+            },
+            enabled = !quickstartBusy,
+            shape = RoundedCornerShape(12.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = mobileSuccess, contentColor = Color.White),
+          ) {
+            Text("Send Test", style = mobileCaption1.copy(fontWeight = FontWeight.Bold))
+          }
+        }
+
+        if (quickstartStatus.isNotBlank()) {
+          Text(quickstartStatus, style = mobileCaption1, color = mobileTextSecondary)
+        }
+      }
     }
 
     // Status cards in a unified card group

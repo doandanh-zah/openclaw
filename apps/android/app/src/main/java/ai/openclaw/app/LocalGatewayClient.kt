@@ -1,0 +1,596 @@
+package ai.openclaw.app
+
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.longOrNull
+
+object LocalGatewayClient {
+  private const val BASE = "http://127.0.0.1:18789"
+
+  data class ApiResult<T>(
+    val ok: Boolean,
+    val value: T? = null,
+    val message: String = "",
+    val statusCode: Int = 0,
+  )
+
+  data class GatewaySummary(
+    val running: Boolean,
+    val port: Int,
+    val tokenReady: Boolean,
+    val kind: String,
+    val installState: String,
+    val networkMode: String,
+    val bindHost: String,
+    val localUrl: String,
+    val lanUrl: String,
+    val proofUrl: String,
+    val chatUrl: String,
+    val controlUiReady: Boolean,
+    val chatPathReady: Boolean,
+    val chatPathMessage: String,
+  )
+
+  data class OAuthSummary(
+    val ready: Boolean,
+    val pending: Boolean,
+    val deviceCode: String,
+    val userCode: String,
+    val verificationUri: String,
+    val verificationUriComplete: String,
+    val accountLabel: String,
+    val hasRefreshToken: Boolean,
+    val lastError: String,
+    val startedAtMs: Long,
+    val completedAtMs: Long,
+  )
+
+  data class ModelSummary(
+    val selected: String,
+    val ready: Boolean,
+    val message: String,
+    val suggested: List<String>,
+  )
+
+  data class TelegramSummary(
+    val configured: Boolean,
+    val botTokenReady: Boolean,
+    val polling: Boolean,
+    val requested: Boolean,
+    val chatId: String,
+    val botTokenMasked: String,
+    val handled: Long,
+    val lastError: String,
+    val lastInbound: String,
+    val lastOutbound: String,
+    val lastTestOk: Boolean,
+    val lastTestAtMs: Long,
+    val lastTestMessage: String,
+    val pairingApproved: Boolean,
+    val pairingPending: Boolean,
+    val pairingCode: String,
+    val pairingChatId: String,
+    val pairingRequestedAtMs: Long,
+    val pairingApprovedAtMs: Long,
+    val pairingMessage: String,
+  )
+
+  data class WizardSnapshot(
+    val gateway: GatewaySummary,
+    val oauth: OAuthSummary,
+    val model: ModelSummary,
+    val telegram: TelegramSummary,
+  )
+
+  data class OAuthDeviceFlow(
+    val deviceCode: String,
+    val userCode: String,
+    val verificationUri: String,
+    val verificationUriComplete: String,
+  )
+
+  private data class HttpResult(
+    val code: Int,
+    val body: String,
+  )
+
+  private val json = Json { ignoreUnknownKeys = true }
+
+  private fun request(
+    method: String,
+    path: String,
+    body: String? = null,
+    bearer: String? = null,
+    timeoutMs: Int = 5_000,
+  ): HttpResult {
+    val conn =
+      (URL("$BASE$path").openConnection() as HttpURLConnection).apply {
+        requestMethod = method
+        connectTimeout = timeoutMs
+        readTimeout = timeoutMs
+        if (!bearer.isNullOrBlank()) {
+          setRequestProperty("Authorization", "Bearer $bearer")
+        }
+        if (body != null) {
+          doOutput = true
+          setRequestProperty("Content-Type", "application/json")
+        }
+      }
+
+    if (body != null) {
+      conn.outputStream.use { it.write(body.toByteArray()) }
+    }
+
+    val code = conn.responseCode
+    val text =
+      (if (code in 200..299) conn.inputStream else conn.errorStream)
+        ?.bufferedReader()
+        ?.use { it.readText() }
+        .orEmpty()
+    return HttpResult(code = code, body = text)
+  }
+
+  private fun requestAuthorized(
+    method: String,
+    path: String,
+    body: String? = null,
+    timeoutMs: Int = 5_000,
+  ): HttpResult {
+    val token = waitForLocalToken(timeoutMs = timeoutMs.coerceAtLeast(2_000))
+    if (token.isBlank()) {
+      return HttpResult(
+        code = 503,
+        body = """{"error":"local_gateway_token_missing","message":"Start Local Gateway first, then retry."}""",
+      )
+    }
+    return request(method = method, path = path, body = body, bearer = token, timeoutMs = timeoutMs)
+  }
+
+  private fun parseObject(text: String): JsonObject? =
+    try {
+      json.parseToJsonElement(text).jsonObject
+    } catch (_: Throwable) {
+      null
+    }
+
+  private fun JsonObject.string(key: String): String =
+    (get(key) as? JsonPrimitive)?.contentOrNull.orEmpty()
+
+  private fun JsonObject.boolean(key: String): Boolean =
+    (get(key) as? JsonPrimitive)?.booleanOrNull == true
+
+  private fun JsonObject.int(key: String): Int =
+    string(key).toIntOrNull() ?: ((get(key) as? JsonPrimitive)?.longOrNull?.toInt() ?: 0)
+
+  private fun JsonObject.long(key: String): Long =
+    string(key).toLongOrNull() ?: ((get(key) as? JsonPrimitive)?.longOrNull ?: 0L)
+
+  private fun JsonObject.stringList(key: String): List<String> =
+    (get(key) as? JsonArray)
+      ?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull?.trim() }
+      ?.filter { it.isNotEmpty() }
+      .orEmpty()
+
+  fun getLocalToken(): String {
+    return try {
+      val body = request("GET", "/token", timeoutMs = 2_000).body
+      parseObject(body)?.string("token").orEmpty()
+    } catch (_: Throwable) {
+      ""
+    }
+  }
+
+  private fun waitForLocalToken(timeoutMs: Int = 3_500, intervalMs: Long = 150L): String {
+    val deadline = System.currentTimeMillis() + timeoutMs
+    while (System.currentTimeMillis() < deadline) {
+      val token = getLocalToken()
+      if (token.isNotBlank()) {
+        return token
+      }
+      Thread.sleep(intervalMs)
+    }
+    return getLocalToken()
+  }
+
+  fun waitForGatewayReady(timeoutMs: Int = 8_000, intervalMs: Long = 350L): ApiResult<WizardSnapshot> {
+    val deadline = System.currentTimeMillis() + timeoutMs
+    var lastFailure = "Local gateway did not respond"
+    while (System.currentTimeMillis() < deadline) {
+      val snapshot = fetchWizardSnapshot()
+      if (snapshot.ok && snapshot.value != null) {
+        return snapshot
+      }
+      if (snapshot.message.isNotBlank()) {
+        lastFailure = snapshot.message
+      }
+      Thread.sleep(intervalMs)
+    }
+    return ApiResult(ok = false, message = lastFailure, statusCode = 504)
+  }
+
+  fun fetchWizardSnapshot(): ApiResult<WizardSnapshot> {
+    return try {
+      val authed = requestAuthorized("GET", "/v1/wizard/status", timeoutMs = 3_500)
+      if (authed.code in 200..299) {
+        val obj = parseObject(authed.body)
+        if (obj != null) {
+          return ApiResult(
+            ok = true,
+            value = parseWizardSnapshot(obj),
+            message = "ok",
+            statusCode = authed.code,
+          )
+        }
+      }
+
+      val fallback = request("GET", "/status", timeoutMs = 3_500)
+      if (fallback.code !in 200..299) {
+        return ApiResult(
+          ok = false,
+          message = parseErrorMessage(fallback.body).ifBlank { "Gateway is offline" },
+          statusCode = fallback.code,
+        )
+      }
+
+      val obj = parseObject(fallback.body)
+        ?: return ApiResult(ok = false, message = "Gateway returned invalid status", statusCode = fallback.code)
+      ApiResult(ok = true, value = parseFallbackSnapshot(obj), message = "ok", statusCode = fallback.code)
+    } catch (t: Throwable) {
+      ApiResult(ok = false, message = t.message ?: t.javaClass.simpleName)
+    }
+  }
+
+  fun startOAuthDeviceFlow(): ApiResult<OAuthDeviceFlow> {
+    val body = """{"clientId":"openclaw-android-local"}"""
+    val result = requestAuthorized("POST", "/v1/oauth/device/start", body)
+    if (result.code !in 200..299) {
+      return ApiResult(ok = false, message = parseErrorMessage(result.body), statusCode = result.code)
+    }
+    val obj = parseObject(result.body)
+      ?: return ApiResult(ok = false, message = "Invalid OAuth response", statusCode = result.code)
+    return ApiResult(
+      ok = true,
+      value =
+        OAuthDeviceFlow(
+          deviceCode = obj.string("deviceCode"),
+          userCode = obj.string("userCode"),
+          verificationUri = obj.string("verificationUri"),
+          verificationUriComplete = obj.string("verificationUriComplete"),
+        ),
+      message = "OAuth login prepared",
+      statusCode = result.code,
+    )
+  }
+
+  fun completeOAuthDeviceFlow(deviceCode: String, accountLabel: String = "ChatGPT linked"): ApiResult<String> {
+    val payload =
+      """{"deviceCode":"${escape(deviceCode)}","accountLabel":"${escape(accountLabel)}"}"""
+    val result = requestAuthorized("POST", "/v1/oauth/device/complete", payload)
+    return simpleMessageResult(result, successMessage = "OAuth completed")
+  }
+
+  fun resetOAuth(): ApiResult<String> {
+    val result = requestAuthorized("POST", "/v1/oauth/reset", body = "{}")
+    return simpleMessageResult(result, successMessage = "OAuth reset")
+  }
+
+  fun setDefaultModel(model: String): ApiResult<String> {
+    val payload = """{"model":"${escape(model)}"}"""
+    val result = requestAuthorized("POST", "/v1/model/default", body = payload)
+    return simpleMessageResult(result, successMessage = "Default model saved")
+  }
+
+  fun setGatewayNetworkMode(networkMode: String): ApiResult<GatewaySummary> {
+    val payload = """{"networkMode":"${escape(networkMode)}"}"""
+    val result = requestAuthorized("POST", "/v1/gateway/network-mode", body = payload)
+    if (result.code !in 200..299) {
+      return ApiResult(ok = false, message = parseErrorMessage(result.body), statusCode = result.code)
+    }
+    val obj = parseObject(result.body)
+      ?: return ApiResult(ok = false, message = "Invalid gateway network response", statusCode = result.code)
+    val summary =
+      GatewaySummary(
+        running = obj.boolean("running"),
+        port = obj.int("port"),
+        tokenReady = getLocalToken().isNotBlank(),
+        kind = obj.string("kind").ifBlank { "android-local-gateway" },
+        installState = obj.string("installState").ifBlank { "bundled-apk" },
+        networkMode = obj.string("networkMode").ifBlank { GatewayLocalService.NETWORK_MODE_LOCAL },
+        bindHost = obj.string("bindHost"),
+        localUrl = obj.string("localUrl"),
+        lanUrl = obj.string("lanUrl"),
+        proofUrl = obj.string("proofUrl"),
+        chatUrl = obj.string("chatUrl"),
+        controlUiReady = obj.boolean("controlUiReady"),
+        chatPathReady = obj.boolean("chatPathReady"),
+        chatPathMessage = obj.string("chatPathMessage"),
+      )
+    return ApiResult(
+      ok = true,
+      value = summary,
+      message = obj.string("message").ifBlank { "Gateway network mode updated" },
+      statusCode = result.code,
+    )
+  }
+
+  fun configureTelegram(botToken: String, chatId: String, startPolling: Boolean = true): ApiResult<String> {
+    val payload =
+      """{"botToken":"${escape(botToken)}","chatId":"${escape(chatId)}","startPolling":$startPolling}"""
+    val result = requestAuthorized("POST", "/v1/config/telegram", payload)
+    return simpleMessageResult(result, successMessage = "Telegram configured")
+  }
+
+  fun saveTelegramBotToken(botToken: String, startPolling: Boolean = true): ApiResult<String> {
+    val payload =
+      """{"botToken":"${escape(botToken)}","startPolling":$startPolling}"""
+    val result = requestAuthorized("POST", "/v1/telegram/token", payload)
+    return simpleMessageResult(result, successMessage = "Telegram bot saved")
+  }
+
+  fun approveTelegramPairing(code: String): ApiResult<String> {
+    val payload = """{"code":"${escape(code)}"}"""
+    val result = requestAuthorized("POST", "/v1/telegram/pairing/approve", payload)
+    return simpleMessageResult(result, successMessage = "Telegram pairing approved")
+  }
+
+  fun quickstartTelegram(botToken: String, chatId: String): ApiResult<String> {
+    val payload = """{"botToken":"${escape(botToken)}","chatId":"${escape(chatId)}"}"""
+    val result = requestAuthorized("POST", "/v1/setup/quickstart", payload)
+    return simpleMessageResult(result, successMessage = "Telegram quick setup complete")
+  }
+
+  fun discoverTelegramChatId(botToken: String): ApiResult<String> {
+    if (botToken.isBlank()) return ApiResult(ok = false, message = "Bot token is required")
+    return try {
+      val endpoint =
+        "https://api.telegram.org/bot${botToken.trim()}/getUpdates?timeout=1&allowed_updates=" +
+          URLEncoder.encode("[\"message\"]", "UTF-8")
+      val conn =
+        (URL(endpoint).openConnection() as HttpURLConnection).apply {
+          requestMethod = "GET"
+          connectTimeout = 5000
+          readTimeout = 10000
+        }
+      val code = conn.responseCode
+      val body =
+        (if (code in 200..299) conn.inputStream else conn.errorStream)
+          ?.bufferedReader()
+          ?.use { it.readText() }
+          .orEmpty()
+      if (code !in 200..299) {
+        return ApiResult(ok = false, message = parseErrorMessage(body), statusCode = code)
+      }
+      val root = parseObject(body) ?: return ApiResult(ok = false, message = "Invalid Telegram response")
+      val resultArr = root["result"]?.jsonArray.orEmpty()
+      val chatIds =
+        resultArr
+          .mapNotNull { updateEl ->
+            val updateObj = updateEl.jsonObject
+            val msgObj = updateObj["message"]?.jsonObject ?: return@mapNotNull null
+            val chatObj = msgObj["chat"]?.jsonObject ?: return@mapNotNull null
+            chatObj["id"]?.let { idEl ->
+              (idEl as? JsonPrimitive)?.contentOrNull
+            }
+          }
+          .filter { it.isNotBlank() }
+      val picked = chatIds.lastOrNull()
+      if (picked.isNullOrBlank()) {
+        ApiResult(ok = false, message = "No chat found yet. Send /start to your bot then retry.")
+      } else {
+        ApiResult(ok = true, value = picked, message = "Chat id discovered")
+      }
+    } catch (t: Throwable) {
+      ApiResult(ok = false, message = t.message ?: t.javaClass.simpleName)
+    }
+  }
+
+  fun startTelegramPolling(): ApiResult<String> {
+    val result = requestAuthorized("POST", "/v1/telegram/poll/start", body = "{}")
+    return simpleMessageResult(result, successMessage = "Telegram polling started")
+  }
+
+  fun stopTelegramPolling(): ApiResult<String> {
+    val result = requestAuthorized("POST", "/v1/telegram/poll/stop", body = "{}")
+    return simpleMessageResult(result, successMessage = "Telegram polling stopped")
+  }
+
+  fun resetTelegram(): ApiResult<String> {
+    val result = requestAuthorized("POST", "/v1/telegram/reset", body = "{}")
+    return simpleMessageResult(result, successMessage = "Telegram config cleared")
+  }
+
+  fun sendTelegramTest(text: String, chatId: String? = null): ApiResult<String> {
+    val extraChat = chatId?.trim().orEmpty()
+    val payload =
+      buildString {
+        append("{\"text\":\"${escape(text)}\"")
+        if (extraChat.isNotBlank()) {
+          append(",\"chatId\":\"${escape(extraChat)}\"")
+        }
+        append("}")
+      }
+    val result = requestAuthorized("POST", "/v1/telegram/send", payload)
+    return simpleMessageResult(result, successMessage = "Test message sent")
+  }
+
+  private fun simpleMessageResult(result: HttpResult, successMessage: String): ApiResult<String> {
+    return if (result.code in 200..299) {
+      val message = parseObject(result.body)?.string("message").orEmpty().ifBlank { successMessage }
+      ApiResult(ok = true, value = message, message = message, statusCode = result.code)
+    } else {
+      ApiResult(ok = false, message = parseErrorMessage(result.body), statusCode = result.code)
+    }
+  }
+
+  private fun parseWizardSnapshot(root: JsonObject): WizardSnapshot {
+    val gatewayObj = root["gateway"]?.jsonObject ?: JsonObject(emptyMap())
+    val oauthObj = root["oauth"]?.jsonObject ?: JsonObject(emptyMap())
+    val modelObj = root["model"]?.jsonObject ?: JsonObject(emptyMap())
+    val telegramObj = root["telegram"]?.jsonObject ?: JsonObject(emptyMap())
+    return WizardSnapshot(
+      gateway =
+        GatewaySummary(
+          running = gatewayObj.boolean("running"),
+          port = gatewayObj.int("port"),
+          tokenReady = gatewayObj.boolean("tokenReady"),
+          kind = gatewayObj.string("kind").ifBlank { "android-local-gateway" },
+          installState = gatewayObj.string("installState").ifBlank { "bundled-apk" },
+          networkMode = gatewayObj.string("networkMode").ifBlank { GatewayLocalService.NETWORK_MODE_LOCAL },
+          bindHost = gatewayObj.string("bindHost"),
+          localUrl = gatewayObj.string("localUrl"),
+          lanUrl = gatewayObj.string("lanUrl"),
+          proofUrl = gatewayObj.string("proofUrl"),
+          chatUrl = gatewayObj.string("chatUrl"),
+          controlUiReady = gatewayObj.boolean("controlUiReady"),
+          chatPathReady = gatewayObj.boolean("chatPathReady"),
+          chatPathMessage = gatewayObj.string("chatPathMessage"),
+        ),
+      oauth =
+        OAuthSummary(
+          ready = oauthObj.boolean("ready"),
+          pending = oauthObj.boolean("pending"),
+          deviceCode = oauthObj.string("deviceCode"),
+          userCode = oauthObj.string("userCode"),
+          verificationUri = oauthObj.string("verificationUri"),
+          verificationUriComplete = oauthObj.string("verificationUriComplete"),
+          accountLabel = oauthObj.string("accountLabel"),
+          hasRefreshToken = oauthObj.boolean("hasRefreshToken"),
+          lastError = oauthObj.string("lastError"),
+          startedAtMs = oauthObj.long("startedAtMs"),
+          completedAtMs = oauthObj.long("completedAtMs"),
+        ),
+      model =
+        ModelSummary(
+          selected = modelObj.string("selected"),
+          ready = modelObj.boolean("ready"),
+          message = modelObj.string("message"),
+          suggested = modelObj.stringList("suggested"),
+        ),
+      telegram =
+        TelegramSummary(
+          configured = telegramObj.boolean("configured"),
+          botTokenReady = telegramObj.boolean("botTokenReady"),
+          polling = telegramObj.boolean("polling"),
+          requested = telegramObj.boolean("requested"),
+          chatId = telegramObj.string("chatId"),
+          botTokenMasked = telegramObj.string("botTokenMasked"),
+          handled = telegramObj.long("handled"),
+          lastError = telegramObj.string("lastError"),
+          lastInbound = telegramObj.string("lastInbound"),
+          lastOutbound = telegramObj.string("lastOutbound"),
+          lastTestOk = telegramObj.boolean("lastTestOk"),
+          lastTestAtMs = telegramObj.long("lastTestAtMs"),
+          lastTestMessage = telegramObj.string("lastTestMessage"),
+          pairingApproved = telegramObj.boolean("pairingApproved"),
+          pairingPending = telegramObj.boolean("pairingPending"),
+          pairingCode = telegramObj.string("pairingCode"),
+          pairingChatId = telegramObj.string("pairingChatId"),
+          pairingRequestedAtMs = telegramObj.long("pairingRequestedAtMs"),
+          pairingApprovedAtMs = telegramObj.long("pairingApprovedAtMs"),
+          pairingMessage = telegramObj.string("pairingMessage"),
+        ),
+    )
+  }
+
+  private fun parseFallbackSnapshot(root: JsonObject): WizardSnapshot {
+    val running = root.boolean("running")
+    val port = root.int("port")
+    val tokenReady = root.boolean("tokenReady")
+    return WizardSnapshot(
+      gateway =
+        GatewaySummary(
+          running = running,
+          port = port,
+          tokenReady = tokenReady,
+          kind = root.string("kind").ifBlank { "android-local-gateway" },
+          installState = root.string("installState").ifBlank { "bundled-apk" },
+          networkMode = root.string("networkMode").ifBlank { GatewayLocalService.NETWORK_MODE_LOCAL },
+          bindHost = root.string("bindHost"),
+          localUrl = root.string("localUrl"),
+          lanUrl = root.string("lanUrl"),
+          proofUrl = root.string("proofUrl"),
+          chatUrl = root.string("chatUrl"),
+          controlUiReady = root.boolean("controlUiReady"),
+          chatPathReady = root.boolean("chatPathReady"),
+          chatPathMessage = root.string("chatPathMessage"),
+        ),
+      oauth =
+        OAuthSummary(
+          ready = root.boolean("oauthReady"),
+          pending = false,
+          deviceCode = "",
+          userCode = "",
+          verificationUri = "",
+          verificationUriComplete = "",
+          accountLabel = "",
+          hasRefreshToken = false,
+          lastError = "",
+          startedAtMs = 0L,
+          completedAtMs = 0L,
+        ),
+      model =
+        ModelSummary(
+          selected = "",
+          ready = false,
+          message = "",
+          suggested = emptyList(),
+        ),
+      telegram =
+        TelegramSummary(
+          configured = root.boolean("telegramConfigured"),
+          botTokenReady = root.boolean("telegramConfigured"),
+          polling = false,
+          requested = false,
+          chatId = "",
+          botTokenMasked = "",
+          handled = 0L,
+          lastError = "",
+          lastInbound = "",
+          lastOutbound = "",
+          lastTestOk = false,
+          lastTestAtMs = 0L,
+          lastTestMessage = "",
+          pairingApproved = false,
+          pairingPending = false,
+          pairingCode = "",
+          pairingChatId = "",
+          pairingRequestedAtMs = 0L,
+          pairingApprovedAtMs = 0L,
+          pairingMessage = "",
+        ),
+    )
+  }
+
+  private fun parseErrorMessage(body: String): String {
+    val obj = parseObject(body) ?: return body.ifBlank { "Request failed" }
+    val directMessage = obj.string("message")
+    if (directMessage.isNotBlank()) return directMessage
+    val error = obj["error"]
+    if (error is JsonPrimitive) {
+      return when (val code = error.contentOrNull.orEmpty()) {
+        "local_gateway_token_missing" -> "Start Local Gateway first, then retry."
+        else -> code.ifBlank { body.ifBlank { "Request failed" } }
+      }
+    }
+    val errorObj = error as? JsonObject
+    if (errorObj != null) {
+      return errorObj.string("message").ifBlank { errorObj.string("code") }.ifBlank { body.ifBlank { "Request failed" } }
+    }
+    return body.ifBlank { "Request failed" }
+  }
+
+  private fun escape(value: String): String =
+    value
+      .replace("\\", "\\\\")
+      .replace("\"", "\\\"")
+      .replace("\n", "\\n")
+}

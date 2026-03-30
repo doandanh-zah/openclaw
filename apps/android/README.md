@@ -2,6 +2,21 @@
 
 Status: **extremely alpha**. The app is actively being rebuilt from the ground up.
 
+On this `zah-gateway-local` branch, first launch now drops into a dedicated Android-local gateway setup wizard:
+
+1. Install + start the bundled Android-local gateway service
+2. Connect ChatGPT OAuth
+3. Choose the default model
+4. Set up Telegram Bot, approve pairing, and send a test
+
+Step 2 now uses the real OpenAI Codex OAuth QR/browser flow with a local `localhost:1455` callback listener, so the wizard can auto-detect completion after the browser returns.
+
+Step 1 now lets the user choose `This Phone` (`127.0.0.1` only) or `Same Wi-Fi` (`0.0.0.0` bind with a detected LAN URL) before starting the local gateway, and exposes `/chat?session=main` as a lightweight local proof/status page so the app can demonstrate the service is alive.
+
+This branch targets direct on-device usage: the gateway runs locally on Android, with in-app OAuth, model selection, and Telegram pairing for basic operation.
+
+After the wizard, the regular app tabs remain available for advanced or remote gateway setup.
+
 ### Rebuild Checklist
 
 - [x] New 4-step onboarding flow

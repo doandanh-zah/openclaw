@@ -63,7 +63,7 @@ android {
 
     defaultConfig {
         applicationId = "ai.openclaw.app"
-        minSdk = 31
+        minSdk = 29
         targetSdk = 36
         versionCode = 2026031400
         versionName = "2026.3.14"
@@ -182,6 +182,7 @@ dependencies {
 
     // Material Components (XML theme + resources)
     implementation("com.google.android.material:material:1.13.0")
+    implementation("com.google.zxing:core:3.5.3")
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.10.0")
